@@ -1,0 +1,25 @@
+# 本地一键起：docker compose --env-file .env up --build
+# .env 从 config/config.example.env 复制，至少设置 AIP_API_KEY 才能用真实模型。
+services:
+  api:
+    build: .
+    image: aiplatform:dev
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      AIP_HOST: 0.0.0.0
+      AIP_PORT: "8080"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    # 生产建议加上资源限制，防止单个进程拖垮机器
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
