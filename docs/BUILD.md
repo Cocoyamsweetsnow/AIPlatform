@@ -62,7 +62,7 @@ cmake -S . -B build \
 
 cmake --build build -j2
 
-# 单元测试（7 项，约 0.4 秒）
+# 单元测试（9 项，约 0.4 秒）
 ctest --test-dir build --output-on-failure
 ```
 
@@ -70,8 +70,13 @@ ctest --test-dir build --output-on-failure
 
 | 路径 | 说明 |
 |---|---|
-| `build/aiplatform` | 服务端二进制 |
+| `build/aiplatform` | 服务端二进制（**内置 Web UI**） |
 | `build/unit_tests` | 单元测试（开了 `-DAIPLATFORM_BUILD_TESTS=ON` 才有） |
+| `build/generated/web_assets.cpp` | 由 `web/` 自动生成的嵌入资源，不用手改 |
+
+前端不需要 npm / node：`cmake --build` 时会执行
+[cmake/embed_web.cmake](../cmake/embed_web.cmake)，把 `web/` 下的 HTML/CSS/JS 生成成
+C++ raw string 编进二进制。改完 `web/` 重新 `cmake --build build -j2` 即可。
 
 ### 1.3 编译报错对照
 
@@ -94,6 +99,10 @@ ctest --test-dir build --output-on-failure
 ```bash
 ./build/aiplatform
 # 日志里会出现: HTTP 服务启动: http://0.0.0.0:8080
+
+# 浏览器打开内置对话页（无需 npm / 静态服务器）
+#   http://127.0.0.1:8080/
+# 只想提供 API：AIP_WEB=false ./build/aiplatform
 
 # 另开终端
 curl -N http://127.0.0.1:8080/v1/chat/completions \
@@ -173,6 +182,7 @@ docker build --target runtime-httplib -t aiplatform:httplib .
 cp config/config.example.env .env
 # 编辑 .env，至少填 AIP_API_KEY（想先用 mock 就不用改）
 docker run --rm -p 8080:8080 --env-file .env aiplatform:dev
+# 浏览器打开 http://127.0.0.1:8080/ —— Web UI 已随二进制嵌入镜像，无需额外静态目录
 
 # 或者用 compose
 docker compose --env-file .env up -d --build

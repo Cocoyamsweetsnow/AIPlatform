@@ -8,8 +8,10 @@
 
 #include "chat/chat_service.h"
 #include "chat/session_store.h"
+#include "http/public_config.h"
 #include "llm/event_queue.h"
 #include "llm/mock_provider.h"
+#include "web/assets.h"
 
 namespace {
 
@@ -154,6 +156,59 @@ void test_cancel_is_idempotent() {
   CHECK(pull == llm::Pull::Cancelled || pull == llm::Pull::End);
 }
 
+void test_web_assets() {
+  // "/" 是 "/index.html" 的别名：直接访问根路径必须能拿到页面。
+  const web::Asset* index = web::find_asset("/");
+  CHECK(index != nullptr);
+  if (index != nullptr) {
+    CHECK(index->path == "/index.html");
+    CHECK(index->content_type.find("text/html") != std::string::npos);
+    CHECK(index->content.find("AIPlatform") != std::string::npos);
+    CHECK(index->content.find("assets/app.js") != std::string::npos);
+  }
+
+  const web::Asset* css = web::find_asset("/assets/app.css");
+  CHECK(css != nullptr);
+  if (css != nullptr) {
+    CHECK(css->content_type.find("text/css") != std::string::npos);
+    CHECK(!css->content.empty());
+  }
+
+  const web::Asset* js = web::find_asset("/assets/app.js");
+  CHECK(js != nullptr);
+  if (js != nullptr) {
+    CHECK(js->content_type.find("javascript") != std::string::npos);
+    CHECK(js->content.find("/v1/chat/completions") != std::string::npos);
+  }
+
+  CHECK(web::asset_count() >= 4);
+  CHECK(web::is_public_asset("/"));
+  CHECK(web::is_public_asset("/favicon.svg"));
+  // 只做精确查表：不能把任意路径映射到文件系统。
+  CHECK(web::find_asset("/../etc/passwd") == nullptr);
+  CHECK(web::find_asset("/index.html/../../etc/passwd") == nullptr);
+  CHECK(!web::is_public_asset("/v1/chat/completions"));
+}
+
+void test_public_config_has_no_secrets() {
+  platform::Config config;
+  config.api_token = "tok";
+  config.api_key = "sk-should-not-leak";
+  config.base_url = "https://internal.example/v1";
+  config.model = "demo-model";
+
+  const std::string body = http::public_config_json(config, "httplib");
+  const auto parsed = nlohmann::json::parse(body);
+  CHECK(parsed["auth_required"] == true);
+  CHECK(parsed["model"] == "demo-model");
+  CHECK(parsed["http"] == "httplib");
+  CHECK(parsed["web"] == true);
+  // 公开接口绝不能带上密钥、上游地址或 system prompt。
+  CHECK(body.find("sk-should-not-leak") == std::string::npos);
+  CHECK(body.find("internal.example") == std::string::npos);
+  CHECK(body.find("api_key") == std::string::npos);
+}
+
 }  // namespace
 
 int main() {
@@ -165,6 +220,8 @@ int main() {
   test_mock_provider_streams();
   test_chat_service_records_history();
   test_cancel_is_idempotent();
+  test_web_assets();
+  test_public_config_has_no_secrets();
 
   if (g_failures == 0) {
     std::printf("all tests passed\n");

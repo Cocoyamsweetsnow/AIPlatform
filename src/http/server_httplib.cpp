@@ -20,8 +20,10 @@
 #include <utility>
 
 #include "common/log.h"
+#include "http/public_config.h"
 #include "httplib.h"
 #include "util/id.h"
+#include "web/assets.h"
 
 namespace http {
 namespace {
@@ -70,6 +72,27 @@ void add_cors(httplib::Response& res) {
   res.set_header("Access-Control-Expose-Headers", "X-Session-Id");
 }
 
+// 内置 Web UI：资源编译进二进制，只按 URL 精确查表，不接触文件系统。
+void send_asset(httplib::Response& res, const web::Asset& asset) {
+  res.set_content(std::string(asset.content), std::string(asset.content_type));
+  res.set_header("Cache-Control", "no-cache");
+  res.set_header("X-Content-Type-Options", "nosniff");
+  res.set_header("Referrer-Policy", "no-referrer");
+  if (asset.content_type.rfind("text/html", 0) == 0) {
+    res.set_header("X-Frame-Options", "DENY");
+    res.set_header("Content-Security-Policy",
+                   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                   "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
+                   "object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+  }
+}
+
+// 不需要 Bearer Token 的公开路径：探针、前端配置、以及内置静态资源。
+bool is_public_path(const platform::Config& config, const std::string& path) {
+  if (path == "/healthz" || path == "/v1/config") return true;
+  return config.web_enabled && web::is_public_asset(path);
+}
+
 // 一次流式响应的共享状态。用 shared_ptr 是因为 httplib 的 provider 是
 // std::function（要求可拷贝），不能直接捕获 unique_ptr。
 struct SseState {
@@ -91,6 +114,7 @@ struct ApiServer::Impl {
   void setup_routes();
   void handle_chat(const httplib::Request& req, httplib::Response& res);
   void handle_history(const httplib::Request& req, httplib::Response& res);
+  void handle_static(const httplib::Request& req, httplib::Response& res);
 
   const platform::Config& config;
   chat::ChatService& service;
@@ -111,7 +135,7 @@ void ApiServer::Impl::setup_routes() {
           res.status = 204;
           return httplib::Server::HandlerResponse::Handled;
         }
-        if (!config.auth_enabled() || req.path == "/healthz") {
+        if (!config.auth_enabled() || is_public_path(config, req.path)) {
           return httplib::Server::HandlerResponse::Unhandled;
         }
         const std::string expected = "Bearer " + config.api_token;
@@ -135,12 +159,29 @@ void ApiServer::Impl::setup_routes() {
     res.set_content(json{{"status", "ok"},
                          {"sessions", store.session_count()},
                          {"active_streams", active_streams.load()},
+                         {"max_streams", config.max_streams},
                          {"model", config.model},
                          {"provider", config.provider},
+                         {"web", config.web_enabled},
                          {"http", "httplib"}}
                         .dump(),
                     "application/json; charset=utf-8");
   });
+
+  // 前端启动时读取的公开配置（是否要求 Token、模型名、大小上限等）。
+  server.Get("/v1/config", [this](const httplib::Request&, httplib::Response& res) {
+    res.set_content(public_config_json(config, "httplib"),
+                    "application/json; charset=utf-8");
+  });
+
+  // 内置 Web UI 首页与静态资源。
+  server.Get("/", [this](const httplib::Request& req, httplib::Response& res) {
+    handle_static(req, res);
+  });
+  server.Get(R"(/(?:index\.html|favicon\.svg|assets/[A-Za-z0-9._\-]+))",
+             [this](const httplib::Request& req, httplib::Response& res) {
+               handle_static(req, res);
+             });
 
   server.Post("/v1/chat/completions",
               [this](const httplib::Request& req, httplib::Response& res) {
@@ -152,8 +193,14 @@ void ApiServer::Impl::setup_routes() {
                handle_history(req, res);
              });
 
+  // 兜底：以后往 web/ 里加新资源，不注册路由也能访问；未知 GET 仍回 JSON 404。
+  server.Get(R"(/.*)", [this](const httplib::Request& req, httplib::Response& res) {
+    handle_static(req, res);
+  });
+
   server.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
-    if (res.status == 404) {
+    // 静态资源处理器会自己写更具体的 404（资源不存在 / Web UI 已禁用），不要覆盖。
+    if (res.status == 404 && res.body.empty()) {
       send_error(res, 404, "not_found", "接口不存在: " + req.path);
     }
   });
@@ -375,6 +422,17 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
         state->stream->cancel();
         active_streams.fetch_sub(1);
       });
+}
+
+void ApiServer::Impl::handle_static(const httplib::Request& req, httplib::Response& res) {
+  if (!config.web_enabled) {
+    return send_error(res, 404, "not_found", "Web UI 已禁用（AIP_WEB=false）");
+  }
+  const web::Asset* asset = web::find_asset(req.path);
+  if (asset == nullptr) {
+    return send_error(res, 404, "not_found", "资源不存在: " + req.path);
+  }
+  send_asset(res, *asset);
 }
 
 void ApiServer::Impl::handle_history(const httplib::Request& req, httplib::Response& res) {

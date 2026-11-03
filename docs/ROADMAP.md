@@ -387,6 +387,10 @@ CREATE INDEX idx_usage_user_time ON usage_records(user_id, created_at DESC);
 
 ### 阶段 5：前端（1~2 周）
 
+> **现状（2026-11-03）**：仓库内置了一个零构建单页 `web/`（编译进二进制），
+> 覆盖「对话页 + 流式 + Markdown + 本地会话 + 移动端」，用于演示和联调；
+> 登录、多租户、云端会话同步仍不在里面。生产前端的两条路不变。
+
 **不要自己从零写。** 两条路：
 
 1. **直接复用**：Open WebUI / LobeChat / ChatGPT-Next-Web，把「OpenAI 接口地址」指向你的服务即可（它们支持自定义 base URL）；

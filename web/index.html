@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="description" content="AIPlatform — C++20 流式 AI 对话平台。OpenAI 兼容接口，SSE 逐字输出。" />
+  <meta name="theme-color" content="#070a12" />
+  <title>AIPlatform</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/assets/app.css" />
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+    <symbol id="i-spark" viewBox="0 0 24 24">
+      <path fill="currentColor" d="M12 2c.62 4.94 2.36 6.78 7 7.4-4.64.62-6.38 2.46-7 7.4-.62-4.94-2.36-6.78-7-7.4 4.64-.62 6.38-2.46 7-7.4Z"/>
+      <path fill="currentColor" opacity=".55" d="M18.5 15.5c.27 2.1 1 2.88 3 3.15-2 .27-2.73 1.05-3 3.15-.27-2.1-1-2.88-3-3.15 2-.27 2.73-1.05 3-3.15Z"/>
+    </symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></g>
+    </symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5H8l-5 3 1.3-5.3A8.5 8.5 0 1 1 21 11.5Z"/>
+        <path d="M8.5 11.5h7M8.5 8.5h4"/>
+      </g>
+    </symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/>
+      </g>
+    </symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+        <path d="M4 7h5M15 7h5M4 17h9M19 17h1M4 12h2M12 12h8"/>
+        <circle cx="12" cy="7" r="2.3"/><circle cx="16" cy="17" r="2.3"/><circle cx="9" cy="12" r="2.3"/>
+      </g>
+    </symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round">
+        <circle cx="12" cy="12" r="4"/>
+        <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
+      </g>
+    </symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24">
+      <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M20 14.5A8.5 8.5 0 1 1 9.5 4a6.6 6.6 0 0 0 10.5 10.5Z"/>
+    </symbol>
+    <symbol id="i-arrow-up" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"/></g>
+    </symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24">
+      <rect x="7" y="7" width="10" height="10" rx="2.2" fill="currentColor"/>
+    </symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M5 15V5.5A2.5 2.5 0 0 1 7.5 3H17"/>
+      </g>
+    </symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5"/>
+      </g>
+    </symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></g>
+    </symbol>
+    <symbol id="i-x" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></g>
+    </symbol>
+    <symbol id="i-key" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="8" cy="15" r="4"/><path d="m11 12 8-8M16 7l2 2M14 9l2 2"/>
+      </g>
+    </symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3.5 22 20H2L12 3.5Z"/><path d="M12 9.5v5M12 17.5v.01"/>
+      </g>
+    </symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24">
+      <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="m12 3 8 3v5.5c0 5-3.4 8.2-8 9.5-4.6-1.3-8-4.5-8-9.5V6l8-3Z"/>
+    </symbol>
+    <symbol id="i-code" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/></g>
+    </symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="4" width="18" height="16" rx="3"/><path d="m7 9 3 3-3 3M13 15h4"/>
+      </g>
+    </symbol>
+    <symbol id="i-book" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v16H6.5A2.5 2.5 0 0 0 4 21.5V5.5Z"/><path d="M4 18.5A2.5 2.5 0 0 1 6.5 16H20"/>
+      </g>
+    </symbol>
+    <symbol id="i-wand" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="m5 19 9-9M15 4l.7 1.8L17.5 6.5l-1.8.7L15 9l-.7-1.8L12.5 6.5l1.8-.7L15 4ZM20 11l.5 1.2 1.2.5-1.2.5L20 14.5l-.5-1.3-1.3-.5 1.3-.5L20 11Z"/>
+      </g>
+    </symbol>
+    <symbol id="i-external" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>
+      </g>
+    </symbol>
+    <symbol id="i-check" viewBox="0 0 24 24">
+      <path fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" d="M20 6 9 17l-5-5"/>
+    </symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24">
+      <path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6"/>
+    </symbol>
+    <symbol id="i-zap" viewBox="0 0 24 24">
+      <path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M13 2 3 14h7l-1 8 11-13h-7l0-7Z"/>
+    </symbol>
+  </svg>
+
+  <div class="ambient" aria-hidden="true">
+    <span class="orb orb-a"></span>
+    <span class="orb orb-b"></span>
+    <span class="orb orb-c"></span>
+    <span class="grid-mask"></span>
+  </div>
+
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar" aria-label="会话侧边栏">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><svg class="icon"><use href="#i-spark"></use></svg></div>
+        <div class="brand-text">
+          <strong>AIPlatform</strong>
+          <span>C++20 · Streaming</span>
+        </div>
+        <button class="icon-btn sidebar-close" id="sidebarClose" type="button" aria-label="关闭侧边栏">
+          <svg class="icon"><use href="#i-x"></use></svg>
+        </button>
+      </div>
+
+      <button class="new-chat" id="newChatBtn" type="button">
+        <svg class="icon"><use href="#i-plus"></use></svg>
+        <span>新对话</span>
+        <kbd class="kbd-hint">⌘K</kbd>
+      </button>
+
+      <div class="sessions-head">
+        <span>最近对话</span>
+        <button class="text-btn" id="clearSessionsBtn" type="button">清空</button>
+      </div>
+      <nav class="session-list" id="sessionList" aria-label="历史会话"></nav>
+
+      <div class="sidebar-footer">
+        <div class="status-card" id="statusCard">
+          <span class="status-dot is-pending" id="statusDot"></span>
+          <div class="status-text">
+            <strong id="statusText">正在连接…</strong>
+            <span id="statusMeta">/healthz</span>
+          </div>
+          <button class="icon-btn status-retry" id="statusRetry" type="button" aria-label="重新检测服务状态">
+            <svg class="icon"><use href="#i-refresh"></use></svg>
+          </button>
+        </div>
+        <button class="footer-btn" id="settingsBtn" type="button">
+          <svg class="icon"><use href="#i-settings"></use></svg>
+          <span>设置</span>
+          <svg class="icon footer-chevron"><use href="#i-chevron-down"></use></svg>
+        </button>
+      </div>
+    </aside>
+
+    <button class="sidebar-scrim" id="sidebarScrim" type="button" aria-label="关闭侧边栏" hidden></button>
+
+    <main class="main">
+      <header class="topbar" id="topbar">
+        <button class="icon-btn menu-btn" id="menuBtn" type="button" aria-label="打开侧边栏">
+          <svg class="icon"><use href="#i-menu"></use></svg>
+        </button>
+        <div class="topbar-title">
+          <h1 id="chatTitle">新对话</h1>
+          <span class="model-pill" id="modelPill">mock</span>
+        </div>
+        <div class="topbar-actions">
+          <span class="live-pill" id="livePill"><span class="live-dot"></span><span id="liveText">连接中</span></span>
+          <button class="icon-btn" id="themeBtn" type="button" aria-label="切换深色 / 浅色主题">
+            <svg class="icon icon-moon"><use href="#i-moon"></use></svg>
+            <svg class="icon icon-sun"><use href="#i-sun"></use></svg>
+          </button>
+          <button class="icon-btn" id="settingsBtnTop" type="button" aria-label="设置">
+            <svg class="icon"><use href="#i-settings"></use></svg>
+          </button>
+        </div>
+      </header>
+
+      <div class="banner-stack">
+        <div class="banner banner-auth" id="authBanner" hidden>
+          <svg class="icon banner-icon"><use href="#i-key"></use></svg>
+          <div class="banner-copy">
+            <strong>此服务已启用访问鉴权</strong>
+            <span>填写 <code>AIP_TOKEN</code> 对应的 Token 后才能开始对话。</span>
+          </div>
+          <button class="btn btn-small" id="bannerTokenBtn" type="button">填写 Token</button>
+        </div>
+        <div class="banner banner-offline" id="offlineBanner" hidden>
+          <svg class="icon banner-icon"><use href="#i-alert"></use></svg>
+          <div class="banner-copy">
+            <strong>无法连接后端服务</strong>
+            <span>请确认 <code>./build/aiplatform</code> 已启动，然后重试。</span>
+          </div>
+          <button class="btn btn-small" id="offlineRetryBtn" type="button">重试</button>
+        </div>
+      </div>
+
+      <div class="chat-scroll" id="chatScroll">
+        <section class="welcome" id="welcome">
+          <div class="welcome-inner">
+            <div class="welcome-mark" aria-hidden="true">
+              <span class="welcome-ring"></span>
+              <svg class="icon"><use href="#i-spark"></use></svg>
+            </div>
+            <p class="eyebrow"><span class="eyebrow-dot"></span> SSE · OpenAI 兼容 · 可插拔模型网关</p>
+            <h2>今天想聊点什么？</h2>
+            <p class="welcome-sub">后端已经就绪。消息会通过 <code>/v1/chat/completions</code> 流式返回，逐字出现在这里。</p>
+
+            <div class="suggestions" id="suggestions">
+              <button class="suggestion" type="button" data-prompt="用通俗的中文解释 SSE 流式输出是怎么工作的，以及浏览器如何消费它。">
+                <span class="suggestion-icon tint-cyan"><svg class="icon"><use href="#i-zap"></use></svg></span>
+                <span class="suggestion-body">
+                  <strong>解释 SSE 流式输出</strong>
+                  <span>从协议到浏览器消费的完整链路</span>
+                </span>
+                <svg class="icon suggestion-go"><use href="#i-arrow-up"></use></svg>
+              </button>
+              <button class="suggestion" type="button" data-prompt="写一个 C++20 的 RAII 示例，用 unique_ptr 管理资源，并解释为什么这样写是异常安全的。">
+                <span class="suggestion-icon tint-indigo"><svg class="icon"><use href="#i-code"></use></svg></span>
+                <span class="suggestion-body">
+                  <strong>写一段 C++20 RAII</strong>
+                  <span>unique_ptr 管理资源与异常安全</span>
+                </span>
+                <svg class="icon suggestion-go"><use href="#i-arrow-up"></use></svg>
+              </button>
+              <button class="suggestion" type="button" data-prompt="为一个 AI 对话服务设计限流方案：单机和多实例部署分别要考虑什么？给出 2~3 个方案和取舍。">
+                <span class="suggestion-icon tint-amber"><svg class="icon"><use href="#i-shield"></use></svg></span>
+                <span class="suggestion-body">
+                  <strong>设计一个限流方案</strong>
+                  <span>单机与多实例的取舍</span>
+                </span>
+                <svg class="icon suggestion-go"><use href="#i-arrow-up"></use></svg>
+              </button>
+              <button class="suggestion" type="button" data-prompt="帮我写一段产品介绍：面向开发者的 AI 对话平台，支持流式输出、OpenAI 兼容接口、离线 mock 演示。要求简洁、有画面感。">
+                <span class="suggestion-icon tint-rose"><svg class="icon"><use href="#i-wand"></use></svg></span>
+                <span class="suggestion-body">
+                  <strong>写一段产品介绍</strong>
+                  <span>面向开发者，简洁有画面感</span>
+                </span>
+                <svg class="icon suggestion-go"><use href="#i-arrow-up"></use></svg>
+              </button>
+            </div>
+
+            <div class="welcome-foot">
+              <span><kbd>Enter</kbd> 发送</span>
+              <span class="welcome-foot-sep"></span>
+              <span><kbd>Shift</kbd> + <kbd>Enter</kbd> 换行</span>
+              <span class="welcome-foot-sep"></span>
+              <span>mock 模式不消耗 token</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="messages" id="messages" aria-label="对话消息"></section>
+      </div>
+
+      <div class="scroll-bottom-wrap">
+        <button class="scroll-bottom" id="scrollBottomBtn" type="button" aria-label="回到底部">
+          <svg class="icon"><use href="#i-chevron-down"></use></svg>
+        </button>
+      </div>
+
+      <footer class="composer-area">
+        <div class="composer" id="composer">
+          <label class="visually-hidden" for="input">消息内容</label>
+          <textarea id="input" rows="1" maxlength="32768" placeholder="给 AIPlatform 发送消息…" spellcheck="false" autocomplete="off"></textarea>
+          <div class="composer-tools">
+            <div class="composer-hints">
+              <span class="hint-key"><kbd>Enter</kbd> 发送</span>
+              <span class="hint-key"><kbd>Shift</kbd> + <kbd>Enter</kbd> 换行</span>
+              <span class="char-count" id="charCount" hidden></span>
+            </div>
+            <div class="composer-actions">
+              <button class="send-btn" id="sendBtn" type="button" aria-label="发送消息" disabled>
+                <svg class="icon send-icon"><use href="#i-arrow-up"></use></svg>
+                <svg class="icon stop-icon"><use href="#i-stop"></use></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+        <p class="disclaimer">
+          AI 生成内容仅供参考 · 当前模型 <span id="footerModel">mock</span> · 服务端内存会话重启即失效
+        </p>
+      </footer>
+    </main>
+  </div>
+
+  <dialog class="dialog" id="settingsDialog" aria-labelledby="settingsTitle">
+    <div class="dialog-card">
+      <div class="dialog-head">
+        <div>
+          <h2 id="settingsTitle">设置</h2>
+          <p>连接参数只保存在本机浏览器。</p>
+        </div>
+        <button class="icon-btn" id="settingsClose" type="button" aria-label="关闭设置">
+          <svg class="icon"><use href="#i-x"></use></svg>
+        </button>
+      </div>
+
+      <div class="dialog-body">
+        <section class="setting-group">
+          <label class="setting-label" for="tokenInput">访问 Token</label>
+          <p class="setting-help">服务端设置 <code>AIP_TOKEN</code> 时必填。仅保存在 localStorage，不会发送到其他域名。</p>
+          <div class="token-row">
+            <input id="tokenInput" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴 Bearer Token（未启用鉴权可留空）" />
+            <button class="text-btn" id="toggleTokenBtn" type="button">显示</button>
+          </div>
+          <div class="auth-state" id="authState">当前服务未启用鉴权</div>
+        </section>
+
+        <section class="setting-group">
+          <span class="setting-label">外观</span>
+          <div class="segmented" id="themeSeg" role="radiogroup" aria-label="主题">
+            <button type="button" data-theme-choice="dark" role="radio" aria-checked="true">深色</button>
+            <button type="button" data-theme-choice="light" role="radio" aria-checked="false">浅色</button>
+            <button type="button" data-theme-choice="system" role="radio" aria-checked="false">跟随系统</button>
+          </div>
+        </section>
+
+        <section class="setting-group">
+          <span class="setting-label">服务信息</span>
+          <dl class="kv">
+            <div><dt>接口地址</dt><dd id="infoEndpoint">-</dd></div>
+            <div><dt>模型 / 提供方</dt><dd id="infoModel">-</dd></div>
+            <div><dt>HTTP 后端</dt><dd id="infoBackend">-</dd></div>
+            <div><dt>版本</dt><dd id="infoVersion">-</dd></div>
+          </dl>
+        </section>
+
+        <section class="setting-group danger-group">
+          <span class="setting-label">本地数据</span>
+          <p class="setting-help">会话默认保存在本机 localStorage；服务端会话是内存态，重启即失效。</p>
+          <button class="btn btn-danger" id="settingsClearBtn" type="button">清空本地会话</button>
+        </section>
+      </div>
+
+      <div class="dialog-foot">
+        <span class="dialog-tip" id="dialogTip"></span>
+        <div class="dialog-actions">
+          <button class="btn" id="settingsCancel" type="button">取消</button>
+          <button class="btn btn-primary" id="settingsSave" type="button">保存</button>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <div class="toast-stack" id="toastStack" aria-live="polite" aria-atomic="false"></div>
+</body>
+</html>

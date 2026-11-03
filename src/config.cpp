@@ -51,6 +51,7 @@ Config Config::from_env() {
   c.host = env_str("AIP_HOST", c.host);
   c.port = env_int("AIP_PORT", c.port);
   c.api_token = env_str("AIP_TOKEN", c.api_token);
+  c.web_enabled = env_bool("AIP_WEB", c.web_enabled);
 
   c.provider = env_str("AIP_PROVIDER", c.provider);
   c.base_url = env_str("AIP_BASE_URL", c.base_url);

@@ -44,11 +44,37 @@ add_library(ai_core STATIC
   src/chat/chat_service.cpp
 )
 
+# ---- Web UI（编译期嵌入二进制）-----------------------------------------
+# 前端保持「零构建」：没有 npm / node_modules，源码直接进二进制，部署仍是一个可执行文件。
+# 改完 web/ 重新 cmake --build 即可；新增文件由 CONFIGURE_DEPENDS 触发重新配置。
+set(AIP_WEB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/web")
+file(GLOB_RECURSE AIP_WEB_FILES CONFIGURE_DEPENDS "${AIP_WEB_DIR}/*")
+# 不把 .env / .DS_Store 之类的隐藏文件编进公开站点。
+list(FILTER AIP_WEB_FILES EXCLUDE REGEX "/\\.[^/]+$")
+if(NOT AIP_WEB_FILES)
+  message(FATAL_ERROR "web/ 目录为空：内置 Web UI 至少需要 web/index.html")
+endif()
+
+set(AIP_WEB_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/generated/web_assets.cpp")
+add_custom_command(
+  OUTPUT "${AIP_WEB_GENERATED}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+  COMMAND ${CMAKE_COMMAND}
+          -DINPUT_DIR=${AIP_WEB_DIR}
+          -DOUTPUT_FILE=${AIP_WEB_GENERATED}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_web.cmake
+  DEPENDS ${AIP_WEB_FILES} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_web.cmake
+  COMMENT "Embedding web UI into aiplatform binary"
+  VERBATIM
+)
+target_sources(ai_core PRIVATE "${AIP_WEB_GENERATED}")
+
 target_include_directories(ai_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 target_link_libraries(ai_core PUBLIC ${CURL_TARGET} Threads::Threads)
+target_compile_definitions(ai_core PUBLIC AIP_VERSION="${PROJECT_VERSION}")
 
 if(AIPLATFORM_HTTP STREQUAL "drogon")
   # Drogon 必须 >= 1.9.14：newAsyncStreamResponse 在 1.9.0 里还不存在。

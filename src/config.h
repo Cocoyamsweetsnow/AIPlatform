@@ -11,6 +11,7 @@ struct Config {
   std::string host{"0.0.0.0"};
   int port{8080};
   std::string api_token;  // 为空表示不鉴权（仅本地开发）
+  bool web_enabled{true};  // 是否提供内置 Web UI（AIP_WEB=false 可切成纯 API 模式）
 
   // 上游模型
   std::string provider{"mock"};  // mock | openai

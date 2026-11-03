@@ -6,9 +6,10 @@
 这个仓库解决的是「从 0 到第一个能跑通、能演示、能接真实模型」的那一段，
 所有代码都围绕一个目标：**让流式对话链路先正确地跑起来**。
 
-## 已实现（阶段 0~2）
+## 已实现（阶段 0~2 + 内置演示前端）
 
-- ✅ HTTP 服务（**Drogon**，连接不占线程）：`/healthz`、`/v1/chat/completions`、`/v1/sessions/{id}/messages`
+- ✅ HTTP 服务（**Drogon**，连接不占线程）：`/healthz`、`/v1/config`、`/v1/chat/completions`、`/v1/sessions/{id}/messages`
+- ✅ 内置 Web UI（零构建单页，编译进二进制）：流式对话、Markdown / 代码块、会话本地持久化、明暗主题、Token 设置
 - ✅ SSE 流式输出，OpenAI 兼容的 chunk 格式（前端工具链可直接复用）
 - ✅ 模型网关：`Provider` 抽象 + OpenAI 兼容实现 + 离线 `mock` 实现
 - ✅ 上游 SSE 增量解析、非流式自动降级、上游错误映射
@@ -73,6 +74,40 @@ export AIP_MODEL=deepseek-chat
 
 完整配置项见 [config/config.example.env](config/config.example.env)。
 
+## Web 界面
+
+启动服务后打开 **<http://127.0.0.1:8080/>**，不需要 npm / Node：
+
+- 流式逐字输出，支持 Markdown、代码块高亮与复制、表格、引用
+- 会话自动保存在浏览器 `localStorage`，刷新 / 重开页面可恢复
+- 明暗主题、移动端布局、`Enter` 发送、`Shift+Enter` 换行
+- 服务端启用 `AIP_TOKEN` 时，页面会提示填写 Bearer Token（只存本机）
+- 顶部状态灯来自 `/healthz`；设置里能看到后端类型、模型与版本
+- 请求失败 / 鉴权失败 / 用户停止都会在消息里给出明确状态，可一键重试
+
+实现是**零构建**的：`web/` 下就是 HTML / CSS / JS 源码，CMake 在构建期把整个目录
+嵌入二进制（[cmake/embed_web.cmake](cmake/embed_web.cmake)），部署产物仍然只有一个可执行文件。
+改完前端后重新 `cmake --build build -j2` 即可，不需要另起静态服务器。
+
+```bash
+# 只想提供 API：不暴露 / 与 /assets/*
+AIP_WEB=false ./build/aiplatform
+```
+
+> 正式产品仍建议按 [docs/DECISIONS.md](docs/DECISIONS.md) 的 D6 复用 Open WebUI / LobeChat；
+> 这个内置页面定位是「演示 + 联调 + 无网络依赖的兜底」。
+
+前端启动时读取 `/v1/config`（公开接口，不含密钥）：
+
+```json
+{
+  "app": "AIPlatform", "version": "0.1.0", "api": "openai-compatible",
+  "http": "drogon", "provider": "mock", "model": "deepseek-chat",
+  "auth_required": false, "web": true,
+  "max_message_bytes": 32768, "max_streams": 512
+}
+```
+
 ## API
 
 ### `POST /v1/chat/completions`
@@ -102,10 +137,22 @@ export AIP_MODEL=deepseek-chat
 ```jsonc
 // 正常
 {"status":"ok","sessions":3,"active_streams":0,"max_streams":512,
- "model":"deepseek-chat","provider":"mock","http":"drogon"}
+ "model":"deepseek-chat","provider":"mock","web":true,"http":"drogon"}
 // 正在退出（仍返回 200，避免 liveness 探针误杀；LB 应看 draining 摘流量）
 {"status":"draining","draining":true,...}
 ```
+
+### `GET /v1/config`
+
+前端启动用的公开配置：是否要求 Token、模型名、消息大小上限等。**不含** `api_key`、
+`base_url`、system prompt。消息读取上限由 `/v1/config` 返回，前端据此在发送前提示，
+服务端仍会独立校验。
+
+### 内置静态资源
+
+`GET /`、`/index.html`、`/assets/*`、`/favicon.svg` 由二进制内的资源表直接返回，
+不读文件系统。启用 `AIP_TOKEN` 时这些路径仍然公开（否则页面本身打不开），
+`/v1/chat/completions` 和会话历史接口照常鉴权；`AIP_WEB=false` 时不再暴露。
 
 ### 错误格式
 
@@ -131,11 +178,17 @@ python3 scripts/fake_upstream.py &   # 假上游，验证 OpenAI 协议与错误
 ## 目录结构
 
 ```
+web/                          内置 Web UI（零构建，构建期嵌入二进制）
+├── index.html
+├── favicon.svg
+└── assets/{app.css,app.js}
+cmake/embed_web.cmake         生成 web_assets.cpp，把 web/ 变成 C++ raw string
 src/
 ├── main.cpp                  组装依赖（信号处理由 HTTP 后端自己装）
 ├── config.{h,cpp}            环境变量配置
 ├── common/log.h              极简日志（后续换 spdlog）
 ├── util/id.{h,cpp}           随机 ID / 时间戳
+├── web/assets.h              嵌入资源的查找接口（实现由 CMake 生成）
 ├── llm/                      模型网关
 │   ├── types.h               Provider / Stream / Event 接口
 │   ├── event_queue.h         生产者-消费者队列
@@ -145,7 +198,8 @@ src/
 ├── chat/                     业务层（上下文、会话存储）
 └── http/                     HTTP 层（两个后端，API 契约一致）
     ├── server.h              对外接口（PIMPL，不暴露框架类型）
-    ├── server_drogon.cpp     主线：Drogon + 泵线程 + 准入 + drain
+    ├── public_config.h       /v1/config 的公开字段
+    ├── server_drogon.cpp     主线：Drogon + 泵线程 + 准入 + drain + 内置 UI
     └── server_httplib.cpp    回退：cpp-httplib（-DAIPLATFORM_HTTP=httplib）
 ```
 
@@ -172,7 +226,10 @@ Drogon 用 reactor，**连接本身不占线程**：实测 300 路挂起连接�
 ## 下一步
 
 路线图里列了从阶段 3 到阶段 7 的详细步骤：PostgreSQL 持久化 → 多租户与配额 →
-前端 → 可观测性与压测 → 上线 → RAG / 工具调用 / 本地推理。
+可观测性与压测 → 上线 → RAG / 工具调用 / 本地推理。
+
+内置单页已经覆盖「演示 + 联调」；生产前端是否复用 Open WebUI / 自研 Next.js，
+仍按 [docs/DECISIONS.md](docs/DECISIONS.md) 的 D6 由人拍板。
 
 ## 文档
 
@@ -190,3 +247,7 @@ Drogon 用 reactor，**连接本身不占线程**：实测 300 路挂起连接�
   `third_party/nlohmann/json.hpp` 是个转发头，让 `#include <nlohmann/json.hpp>` 命中仓库内版本
   （此前能编过是因为构建机恰好装了系统包，换机器就挂）。
 - 会话存储目前是**进程内内存**，重启即丢——这是有意的阶段划分，不是 bug。
+- Web UI 没有 `package.json` / `node_modules`：`web/` 由 CMake 在构建期转成 C++
+  raw string（见 [cmake/embed_web.cmake](cmake/embed_web.cmake)），改完前端重新编译即可。
+  页面 CSP 只允许同源脚本；模型输出按不可信文本处理（先转义再渲染，链接只放行
+  `http(s)` / `mailto`），不使用 `innerHTML` 直接插入原始内容。

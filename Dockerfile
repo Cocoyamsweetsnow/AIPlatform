@@ -51,6 +51,8 @@ FROM toolchain AS build-httplib
 ARG BUILD_JOBS=2
 WORKDIR /src
 COPY CMakeLists.txt ./
+COPY cmake ./cmake
+COPY web ./web
 COPY src ./src
 COPY third_party ./third_party
 COPY tests ./tests
@@ -61,6 +63,8 @@ FROM drogon AS build-drogon
 ARG BUILD_JOBS=2
 WORKDIR /src
 COPY CMakeLists.txt ./
+COPY cmake ./cmake
+COPY web ./web
 COPY src ./src
 COPY third_party ./third_party
 COPY tests ./tests

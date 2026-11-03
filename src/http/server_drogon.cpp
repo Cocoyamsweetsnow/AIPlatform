@@ -31,7 +31,9 @@
 #include <vector>
 
 #include "common/log.h"
+#include "http/public_config.h"
 #include "util/id.h"
+#include "web/assets.h"
 
 namespace http {
 namespace {
@@ -72,6 +74,37 @@ HttpResponsePtr json_ok(const json& body) {
   resp->setContentTypeString("application/json; charset=utf-8");
   resp->setBody(body.dump());
   return resp;
+}
+
+HttpResponsePtr body_response(std::string body, const std::string& content_type) {
+  auto resp = drogon::HttpResponse::newHttpResponse();
+  resp->setContentTypeString(content_type);
+  resp->setBody(std::move(body));
+  return resp;
+}
+
+// 内置 Web UI：资源已经编译进二进制，这里只按 URL 精确查表。
+// 不接触文件系统，因此不需要担心目录穿越；文档根目录仍然保持禁用。
+HttpResponsePtr asset_response(const web::Asset& asset) {
+  auto resp = body_response(std::string(asset.content), std::string(asset.content_type));
+  resp->addHeader("Cache-Control", "no-cache");
+  resp->addHeader("X-Content-Type-Options", "nosniff");
+  resp->addHeader("Referrer-Policy", "no-referrer");
+  if (asset.content_type.rfind("text/html", 0) == 0) {
+    resp->addHeader("X-Frame-Options", "DENY");
+    resp->addHeader("Content-Security-Policy",
+                    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                    "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
+                    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+  }
+  return resp;
+}
+
+// 不需要 Bearer Token 的公开路径：探针、前端配置、以及内置静态资源。
+// 对话与历史接口仍然走鉴权。
+bool is_public_path(const platform::Config& config, const std::string& path) {
+  if (path == "/healthz" || path == "/v1/config") return true;
+  return config.web_enabled && web::is_public_asset(path);
 }
 
 void add_cors(const HttpResponsePtr& resp) {
@@ -424,6 +457,7 @@ struct ApiServer::Impl {
                          const std::string& model, const std::string& model_name,
                          const std::shared_ptr<ResponseCallback>& callback);
   void handle_history(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_static(const HttpRequestPtr& req, ResponseCallback&& callback);
   void post(const std::shared_ptr<ResponseCallback>& callback, HttpResponsePtr resp);
 
   const platform::Config& config;
@@ -478,6 +512,30 @@ void ApiServer::Impl::setup() {
       },
       {drogon::Get});
 
+  // 前端启动时读取的公开配置（是否要求 Token、模型名、大小上限等）。
+  drogon::app().registerHandler(
+      "/v1/config",
+      [this](const HttpRequestPtr&, ResponseCallback&& callback) {
+        callback(body_response(public_config_json(config, "drogon"),
+                               "application/json; charset=utf-8"));
+      },
+      {drogon::Get});
+
+  // 内置 Web UI：首页与静态资源。资源是编译期查表，不存在文件系统访问。
+  drogon::app().registerHandler(
+      "/",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_static(req, std::move(callback));
+      },
+      {drogon::Get});
+
+  drogon::app().registerHandlerViaRegex(
+      R"(/(?:index\.html|favicon\.svg|assets/[A-Za-z0-9._\-]+))",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_static(req, std::move(callback));
+      },
+      {drogon::Get});
+
   drogon::app().registerHandler(
       "/v1/chat/completions",
       [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
@@ -496,7 +554,13 @@ void ApiServer::Impl::setup() {
       {drogon::Get});
 
   drogon::app().setDefaultHandler(
-      [](const HttpRequestPtr& req, ResponseCallback&& callback) {
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        // 兜底：以后往 web/ 里加新资源，不注册路由也能访问。
+        if (config.web_enabled && req->method() == drogon::Get &&
+            web::find_asset(req->path()) != nullptr) {
+          handle_static(req, std::move(callback));
+          return;
+        }
         callback(error_response(drogon::k404NotFound, "not_found", "接口不存在: " + req->path()));
       });
 }
@@ -516,7 +580,7 @@ void ApiServer::Impl::pre_routing(const HttpRequestPtr& req, drogon::AdviceCallb
     return;
   }
 
-  if (!config.auth_enabled() || req->path() == "/healthz") {
+  if (!config.auth_enabled() || is_public_path(config, req->path())) {
     chain();
     return;
   }
@@ -539,6 +603,7 @@ HttpResponsePtr ApiServer::Impl::health_response() {
             {"max_streams", max_streams},
             {"model", config.model},
             {"provider", config.provider},
+            {"web", config.web_enabled},
             {"http", "drogon"}};
   if (shutting_down.load(std::memory_order_acquire)) {
     // 保持 200：避免把 liveness 探针也打挂导致被强杀；对接负载均衡时看 draining 字段摘流量。
@@ -740,6 +805,19 @@ void ApiServer::Impl::handle_non_stream(const std::string& session_id,
   auto resp = json_ok(out);
   resp->addHeader("X-Session-Id", turn.session_id);
   post(callback, std::move(resp));
+}
+
+void ApiServer::Impl::handle_static(const HttpRequestPtr& req, ResponseCallback&& callback) {
+  if (!config.web_enabled) {
+    callback(error_response(drogon::k404NotFound, "not_found", "Web UI 已禁用（AIP_WEB=false）"));
+    return;
+  }
+  const web::Asset* asset = web::find_asset(req->path());
+  if (asset == nullptr) {
+    callback(error_response(drogon::k404NotFound, "not_found", "资源不存在: " + req->path()));
+    return;
+  }
+  callback(asset_response(*asset));
 }
 
 void ApiServer::Impl::handle_history(const HttpRequestPtr& req, ResponseCallback&& callback) {
