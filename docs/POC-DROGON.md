@@ -1,5 +1,9 @@
 # Drogon SSE POC（决策 0001 的验证步骤）
 
+> **状态（2026-11-02）**：POC 结论**已落地**到 `src/http/server_drogon.cpp`，
+> 本文保留为「怎么复现基线数据」的说明书（`poc/drogon_sse.cpp` 仍在，
+> 用 `-DAIPLATFORM_BUILD_POC=ON` 编）。落地后的实测与遗留问题见
+> [adr/0001-http-framework.md](adr/0001-http-framework.md) 文末「落地记录」。
 > 决策背景见 [0001-http-framework.md](adr/0001-http-framework.md)。
 > 本文只回答三件事：**怎么验、看到什么算通过、不通过怎么办**。
 

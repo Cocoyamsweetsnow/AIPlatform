@@ -8,25 +8,33 @@
 
 ## 已实现（阶段 0~2）
 
-- ✅ HTTP 服务：`/healthz`、`/v1/chat/completions`、`/v1/sessions/{id}/messages`
+- ✅ HTTP 服务（**Drogon**，连接不占线程）：`/healthz`、`/v1/chat/completions`、`/v1/sessions/{id}/messages`
 - ✅ SSE 流式输出，OpenAI 兼容的 chunk 格式（前端工具链可直接复用）
 - ✅ 模型网关：`Provider` 抽象 + OpenAI 兼容实现 + 离线 `mock` 实现
 - ✅ 上游 SSE 增量解析、非流式自动降级、上游错误映射
 - ✅ 客户端断开 → 取消上游请求（不浪费 token）
 - ✅ 多轮上下文（内存会话存储，带 LRU 淘汰）
 - ✅ Bearer Token 鉴权、CORS、请求日志、统一错误码
-- ✅ 优雅退出（SIGTERM）、单元测试、Docker 多阶段构建
+- ✅ 流数量准入（超出 `AIP_MAX_STREAMS` 直接 503）、SSE 心跳
+- ✅ 优雅退出（SIGTERM → 停止接新请求 → 等在途流收尾 → 退出）
+- ✅ 单元测试、Docker 多阶段构建、CI（含 Drogon 镜像冒烟）
+
+> 回退：把 `-DAIPLATFORM_HTTP=httplib` 切到 cpp-httplib 实现，API 契约完全一致，
+> 代价是每连接一线程、并发流上限 = 线程池大小（见 [docs/adr/0001](docs/adr/0001-http-framework.md)）。
 
 ## 快速开始
 
 > 完整的编译 / 运行 / 镜像构建 / 排错手册见 [docs/BUILD.md](docs/BUILD.md)。
 
 ```bash
-# 依赖：CMake ≥ 3.20、支持 C++20 的编译器、libcurl 开发包
+# 依赖：CMake ≥ 3.20、支持 C++20 的编译器、libcurl 开发包、Drogon ≥ 1.9.14
 # Ubuntu: sudo apt install build-essential cmake pkg-config libcurl4-openssl-dev
+# Drogon 需源码编译（约 7~10 分钟），步骤见 docs/BUILD.md 第 1.1 节；
+# 没有 Drogon 的机器可以先用回退后端：
+#   cmake -S . -B build -DAIPLATFORM_HTTP=httplib
 
 cmake -S . -B build -DAIPLATFORM_BUILD_TESTS=ON
-cmake --build build -j
+cmake --build build -j2
 ctest --test-dir build --output-on-failure
 
 # 离线模式（mock 模型，不需要 API key），默认监听 :8080
@@ -82,7 +90,8 @@ export AIP_MODEL=deepseek-chat
 
 - `stream: true` → `text/event-stream`，每个 chunk 是 OpenAI 兼容的 `chat.completion.chunk`，
   结束时发送 `data: [DONE]`；上游出错时发送 `event: error` 再 `[DONE]`。
-- `stream: false` → 一个 `chat.completion` JSON，含 `usage`。
+  在途流达到 `AIP_MAX_STREAMS` 时直接返回 503（`too_many_streams`），不会排队。
+- `stream: false` → 一个 `chat.completion` JSON，含 `usage`（在 WorkerPool 里跑，不占 IO 线程）。
 
 ### `GET /v1/sessions/{id}/messages`
 
@@ -90,7 +99,13 @@ export AIP_MODEL=deepseek-chat
 
 ### `GET /healthz`
 
-`{"status":"ok","sessions":3,"model":"deepseek-chat","provider":"mock"}`
+```jsonc
+// 正常
+{"status":"ok","sessions":3,"active_streams":0,"max_streams":512,
+ "model":"deepseek-chat","provider":"mock","http":"drogon"}
+// 正在退出（仍返回 200，避免 liveness 探针误杀；LB 应看 draining 摘流量）
+{"status":"draining","draining":true,...}
+```
 
 ### 错误格式
 
@@ -117,7 +132,7 @@ python3 scripts/fake_upstream.py &   # 假上游，验证 OpenAI 协议与错误
 
 ```
 src/
-├── main.cpp                  组装依赖、信号处理
+├── main.cpp                  组装依赖（信号处理由 HTTP 后端自己装）
 ├── config.{h,cpp}            环境变量配置
 ├── common/log.h              极简日志（后续换 spdlog）
 ├── util/id.{h,cpp}           随机 ID / 时间戳
@@ -128,26 +143,31 @@ src/
 │   ├── openai_provider.cpp   OpenAI 兼容 + SSE 解析 + 取消
 │   └── mock_provider.cpp     离线假模型
 ├── chat/                     业务层（上下文、会话存储）
-└── http/server.{h,cpp}       路由、鉴权、SSE 编码
+└── http/                     HTTP 层（两个后端，API 契约一致）
+    ├── server.h              对外接口（PIMPL，不暴露框架类型）
+    ├── server_drogon.cpp     主线：Drogon + 泵线程 + 准入 + drain
+    └── server_httplib.cpp    回退：cpp-httplib（-DAIPLATFORM_HTTP=httplib）
 ```
 
 ## 设计要点
 
 **为什么用「后台线程 + 阻塞队列」而不是回调？**
-HTTP 框架的写接口本身就是拉取式（`DataSink`），拉取语义既能适配同步框架，也能适配协程框架。
+`llm::Stream` 是拉取语义，既能适配同步框架，也能适配协程式框架。Drogon 的推送式
+`ResponseStream` 由每路流自己的泵线程桥接（`server_drogon.cpp` 的 `SsePump`）。
 
 **为什么默认 `AIP_PROVIDER=mock`？**
 让前端开发、CI、演示都不依赖网络和 API key。真实项目里它就是集成测试的 stub。
 
-**为什么用 cpp-httplib 而不是 Drogon？**
-起步阶段编译快（秒级）、依赖少（无）。但它**每连接一线程**，每个 SSE 长连接独占一个线程，
-并发上限 = 线程池大小（本项目设为 64）。要支撑数百上千并发长连接，需换异步框架，
-详见 [docs/ROADMAP.md](docs/ROADMAP.md) 阶段 2 与阶段 6。
+**为什么迁移到 Drogon？**
+cpp-httplib 每连接一线程，每个 SSE 长连接独占一个线程，并发上限 = 线程池大小（64）。
+Drogon 用 reactor，**连接本身不占线程**：实测 300 路挂起连接只多 5 个线程。
+迁移代价与边界见 [docs/adr/0001-http-framework.md](docs/adr/0001-http-framework.md)。
 
-> **2026-11-02 更新**：已决定迁移到 Drogon（提前执行路线图的 D1），**POC 已通过**
-> （200 路 SSE / 300 路空闲连接实测，见 [docs/POC-DROGON.md](docs/POC-DROGON.md) 第 5 节），
-> 决策记录见 [docs/adr/0001-http-framework.md](docs/adr/0001-http-framework.md)。
-> 主线代码在 `src/http/` 重写完成前仍是 httplib；Drogon 要求 **≥ 1.9.14**。
+> **2026-11-02 更新**：Drogon 迁移**已落地**（`src/http/server_drogon.cpp`），
+> 200 路 SSE 实测 200/200 成功、线程峰值 409（= 2×200 + 9）、RSS 26 MB；
+> 断连取消、SIGTERM drain（120 路在途全部收尾后退出）、流数量准入均已验证。
+> 迁移**没有**降低单流线程数：每路活跃流仍是 2 个线程（泵 + libcurl 读线程），
+> 要降到 1 或 0 个需要把 `llm::Stream` 改成推送式或上游改非阻塞，见 ADR「后续两步」。
 
 ## 下一步
 

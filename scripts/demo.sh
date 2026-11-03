@@ -40,4 +40,6 @@ echo
 echo "== 5. 错误处理"
 curl -sS -o /dev/null -w '空请求 -> %{http_code}\n' "${BASE}/v1/chat/completions" "${AUTH[@]}" -d '{}'
 curl -sS -o /dev/null -w '非法 JSON -> %{http_code}\n' "${BASE}/v1/chat/completions" "${AUTH[@]}" -d 'oops'
+curl -sS -o /dev/null -w '字段类型错误 -> %{http_code}\n' "${BASE}/v1/chat/completions" "${AUTH[@]}" \
+  -H 'Content-Type: application/json' -d '{"message":"hi","stream":"yes"}'
 curl -sS -o /dev/null -w '未知路由 -> %{http_code}\n' "${BASE}/nope"

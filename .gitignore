@@ -1,6 +1,7 @@
 # ---- 构建产物 -----------------------------------------------------------
 build/
-build-poc/
+# build-poc / build-drogon / build-httplib 等
+build-*/
 cmake-build-*/
 *.o
 *.a

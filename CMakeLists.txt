@@ -12,8 +12,8 @@ endif()
 add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 
 # ---- 依赖 ---------------------------------------------------------------
-# 骨架阶段刻意只用「单头文件 + 系统库」，保证 5 分钟内能跑起来：
-#   - cpp-httplib : HTTP/1.1 服务端（third_party/httplib.h）
+#   - Drogon      : HTTP 服务端（主线，需 >= 1.9.14；见 docs/BUILD.md 安装）
+#   - cpp-httplib : HTTP 服务端（回退项，third_party/httplib.h，仅 -DAIPLATFORM_HTTP=httplib 时用）
 #   - nlohmann/json : JSON（third_party/json.hpp）
 #   - libcurl     : 调用上游大模型 API（支持增量读，SSE 必需）
 find_package(Threads REQUIRED)
@@ -27,6 +27,13 @@ else()
   set(CURL_TARGET CURL::libcurl)
 endif()
 
+# ---- HTTP 后端（决策见 docs/adr/0001-http-framework.md）------------------
+# drogon  ：主线。连接不占线程，SSE 并发只受 max_streams 与线程数约束。
+# httplib ：回退项。Drogon 装不上（客户机房 / 国产化 OS）时仍能构建，
+#           代价是每连接一线程、并发流上限 = 线程池大小。
+set(AIPLATFORM_HTTP "drogon" CACHE STRING "HTTP backend: drogon (default) or httplib")
+set_property(CACHE AIPLATFORM_HTTP PROPERTY STRINGS drogon httplib)
+
 # ---- 核心库 -------------------------------------------------------------
 add_library(ai_core STATIC
   src/config.cpp
@@ -35,7 +42,6 @@ add_library(ai_core STATIC
   src/llm/openai_provider.cpp
   src/chat/session_store.cpp
   src/chat/chat_service.cpp
-  src/http/server.cpp
 )
 
 target_include_directories(ai_core PUBLIC
@@ -43,10 +49,23 @@ target_include_directories(ai_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 target_link_libraries(ai_core PUBLIC ${CURL_TARGET} Threads::Threads)
-target_compile_definitions(ai_core PUBLIC
-  CPPHTTPLIB_THREAD_POOL_COUNT=64
-  CPPHTTPLIB_REQUEST_URI_MAX_LENGTH=8192
-)
+
+if(AIPLATFORM_HTTP STREQUAL "drogon")
+  # Drogon 必须 >= 1.9.14：newAsyncStreamResponse 在 1.9.0 里还不存在。
+  find_package(Drogon CONFIG REQUIRED)
+  target_sources(ai_core PRIVATE src/http/server_drogon.cpp)
+  target_link_libraries(ai_core PUBLIC Drogon::Drogon)
+  target_compile_definitions(ai_core PUBLIC AIP_HTTP_BACKEND_DROGON=1)
+elseif(AIPLATFORM_HTTP STREQUAL "httplib")
+  target_sources(ai_core PRIVATE src/http/server_httplib.cpp)
+  target_compile_definitions(ai_core PUBLIC
+    AIP_HTTP_BACKEND_HTTPLIB=1
+    CPPHTTPLIB_THREAD_POOL_COUNT=64
+    CPPHTTPLIB_REQUEST_URI_MAX_LENGTH=8192
+  )
+else()
+  message(FATAL_ERROR "AIPLATFORM_HTTP 只能是 drogon 或 httplib，当前值: '${AIPLATFORM_HTTP}'")
+endif()
 
 # ---- 可执行文件 ---------------------------------------------------------
 add_executable(aiplatform src/main.cpp)
@@ -62,8 +81,9 @@ if(AIPLATFORM_BUILD_TESTS)
 endif()
 
 # ---- Drogon SSE POC（可选，决策见 docs/adr/0001） ------------------------
-# 默认关闭：主线仍然只依赖 libcurl，没装 Drogon 的机器照常构建。
-# 开启前先按 docs/POC-DROGON.md 安装 Drogon；验证完 POC 和这个开关一起删。
+# 迁移已落地到 src/http/server_drogon.cpp，这个 POC 只剩「压测基线」的作用：
+# 想复现 docs/POC-DROGON.md 里的 200 路 / 300 路数据时才编它。
+# 确认不再需要复现后，可以把这个 option 和 poc/ 目录一起删掉。
 option(AIPLATFORM_BUILD_POC "Build the Drogon SSE proof-of-concept" OFF)
 if(AIPLATFORM_BUILD_POC)
   find_package(Drogon CONFIG REQUIRED)

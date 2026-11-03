@@ -36,9 +36,10 @@
 
 **推荐 A → 并发压测超过 100 路流再换 B。** 切换成本约 400 行（`src/http/server.cpp`），业务层不用动。
 
-> **2026-11-02 更新**：负责人选择**提前切 B**，POC 已通过（200 路 SSE / 300 路空闲连接实测，
-> 见 [POC-DROGON.md](POC-DROGON.md) 第 5 节），ADR 状态转为「已接受」。
-> 下一步是重写 `src/http/`，业务层不动；Drogon 要求 ≥ 1.9.14。
+> **2026-11-02 更新**：负责人选择**提前切 B**，POC 通过（200 路 SSE / 300 路空闲连接实测，
+> 见 [POC-DROGON.md](POC-DROGON.md) 第 5 节），**主线迁移已落地**
+> （`src/http/server_drogon.cpp`，httplib 保留为 `-DAIPLATFORM_HTTP=httplib` 回退项）。
+> Drogon 要求 ≥ 1.9.14。落地实测与遗留问题见 [adr/0001](adr/0001-http-framework.md) 文末。
 
 ### D2. 数据库
 
@@ -130,7 +131,7 @@ Provider 接口已经为 B/C 留好位置：写一个 `llama_provider.cpp` 即�
 
 | # | 决策 | 我的推荐 | 你的选择 | 备注 |
 |---|---|---|---|---|
-| D1 | HTTP 框架 | A. httplib | **B. Drogon（已接受）** | 见 docs/adr/0001、docs/POC-DROGON.md |
+| D1 | HTTP 框架 | A. httplib | **B. Drogon（已落地）** | 见 docs/adr/0001、docs/POC-DROGON.md；httplib 保留为回退项 |
 | D2 | 数据库 | A. PostgreSQL | | 已有 MySQL 运维可选 B |
 | D3 | 数据访问 | A. libpqxx | | |
 | D4 | 缓存 | A. 进程内 | | 上多副本必须 B |

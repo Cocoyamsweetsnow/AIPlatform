@@ -1,6 +1,6 @@
 # 0001 采用 Drogon 作为 HTTP 服务框架
 
-- 状态：**已接受**（POC 已通过，实测数据见 [docs/POC-DROGON.md](../POC-DROGON.md) 第 5 节）
+- 状态：**已落地**（POC 已通过 + 主线迁移完成并回归，见文末「落地记录」）
 - 日期：2026-11-02
 - 决策者：项目负责人（AI 建议）
 - 影响范围：`src/http/`、`main.cpp`、`CMakeLists.txt`、`Dockerfile`；业务层 `llm/` `chat/` 不动
@@ -96,3 +96,42 @@
 
 - Drogon `HttpResponse::newStreamResponse` / `newAsyncStreamResponse` 语义：<https://github.com/drogonframework/drogon/blob/master/lib/inc/drogon/HttpResponse.h>
 - Debian trixie `libdrogon-dev 1.9.0`：<https://packages.debian.org/trixie/libdrogon-dev>
+
+---
+
+## 落地记录（2026-11-02）
+
+迁移已完成，主线是 `src/http/server_drogon.cpp`；`src/http/server_httplib.cpp` 保留为回退实现，
+用 `-DAIPLATFORM_HTTP=httplib` 切换，两者 API 契约一致（同一份 `scripts/demo.sh` 全绿）。
+
+### 相对 POC 补的东西
+
+| 项 | POC | 主线 |
+|---|---|---|
+| 鉴权 / CORS | 无 | `registerPreRoutingAdvice` 鉴权（`/healthz` 豁免）、`registerPreSendingAdvice` 统一加 CORS 与访问日志 |
+| 流数量准入 | 无 | `StreamGate`：超过 `AIP_MAX_STREAMS` 直接 503 `too_many_streams`（推式流没有背压，只能在准入层限） |
+| 非流式 | 每请求 detach 一个线程 | 固定 WorkerPool（队列满回 503），IO 线程零阻塞 |
+| 优雅退出 | 无 drain | SIGTERM → 拒新请求 → 等 `AIP_SHUTDOWN_DRAIN_S` → quit → join 泵线程 |
+| 404 | Drogon 默认页 | `setDefaultHandler` 返回统一 JSON 错误 |
+| 静态文件 | Drogon 默认根目录 `./`（**会把工作目录的源码 / `.env` 暴露成静态站点**） | `setDocumentRoot` 指向不存在目录 + `setFileTypes({})` |
+| idle 超时 | 默认 60s 会掐断「上游思考中」的连接 | `setIdleConnectionTimeout(600)` |
+
+### 实测（4 核容器 / g++ 14.2 / Drogon v1.9.14 / mock 上游）
+
+| 用例 | 结果 |
+|---|---|
+| `scripts/demo.sh`（健康检查/流式/多轮/历史/400/404） | 全绿（Drogon 与 httplib 两个后端各跑一遍） |
+| 200 路 `POST /v1/chat/completions` | 200/200 成功，TTFT p95 82ms，线程峰值 **409**（≈2×200+9），RSS 26.8MB |
+| 压测期间 `/healthz` | 最大 52ms（IO 线程未被流阻塞） |
+| 非流式 8 路并发（worker 池 4 线程） | 4 路 ~0.2s、4 路 ~0.4s（排队行为符合预期），`/healthz` 最大 1.2ms |
+| 客户端 200ms 后 RST | 200ms 时取消上游（日志 `SSE 取消（客户端断开）`） |
+| 120 路在途时 SIGTERM | 收到信号后 151ms 内在途流全部正常结束，进程退出码 0 |
+| `AIP_MAX_STREAMS=2` 时并发 6 路 | 2×200 + 4×503 `too_many_streams` |
+
+### 迁移后仍未解决的（按原计划分两步）
+
+1. **每路活跃流仍是 2 个线程**（泵 + libcurl 读线程）——本次只解除连接层上限；
+2. **取消时延最坏 = 一个心跳周期**（`AIP_HEARTBEAT_S`，默认 15s）：真实模型两个 token
+   之间可能停顿，此时要等下一次 `send()` 或心跳才发现客户端已断开；
+3. 推式流没有背压，慢客户端目前靠「单流在途数据量小 + 全局流数上限」兜住，
+   要做字节级背压需要自己统计 `send` 未 flush 的量（Drogon 1.9.14 没暴露）。

@@ -14,14 +14,8 @@
 
 namespace {
 
-http::ApiServer* g_server = nullptr;
-
-// httplib 的 stop() 会唤醒阻塞中的 accept；在信号处理里直接调用是常见做法，
-// 生产环境更稳妥的方案是 self-pipe / signalfd（见 docs/ROADMAP.md 的 M6）。
-void on_signal(int) {
-  if (g_server != nullptr) g_server->stop();
-}
-
+// 信号处理由 HTTP 后端自己安装：Drogon 用 setTermSignalHandler（带 drain），
+// httplib 回退实现用自己的 handler。main 只负责与框架无关的 SIGPIPE。
 platform::LogLevel parse_level(const char* raw) {
   const std::string level = raw == nullptr ? "" : raw;
   if (level == "debug" || level == "DEBUG") return platform::LogLevel::Debug;
@@ -67,9 +61,6 @@ int main() {
     chat::ChatService service(*provider, store, std::move(chat_options));
 
     http::ApiServer server(config, service, store);
-    g_server = &server;
-    std::signal(SIGINT, on_signal);
-    std::signal(SIGTERM, on_signal);
     std::signal(SIGPIPE, SIG_IGN);  // 客户端断开时不要被 SIGPIPE 干掉
 
     log_info("try: curl -N http://127.0.0.1:" + std::to_string(config.port) +
@@ -77,7 +68,6 @@ int main() {
              "-d '{\"message\":\"你好\"}'");
 
     const bool ok = server.run();
-    g_server = nullptr;
     if (!ok) {
       log_error("服务启动失败：端口可能已被占用");
       return 1;

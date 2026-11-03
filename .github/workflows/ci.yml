@@ -7,8 +7,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-test:
-    name: build & test (ubuntu)
+  # 快速门禁：httplib 回退后端编译 + 单元测试，约 1 分钟。
+  # 目的是「任何一次提交都有人管」，Drogon 那条慢链路放在下面单独跑。
+  unit-httplib:
+    name: 单元测试（httplib 回退后端）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,11 +21,48 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake pkg-config libcurl4-openssl-dev
 
-      - name: 配置（CMake）
-        run: cmake -S . -B build -DAIPLATFORM_BUILD_TESTS=ON
+      - name: 配置（httplib 后端）
+        run: cmake -S . -B build -DAIPLATFORM_HTTP=httplib -DAIPLATFORM_BUILD_TESTS=ON
 
       - name: 编译
         run: cmake --build build -j"$(nproc)"
 
       - name: 单元测试
         run: ctest --test-dir build --output-on-failure
+
+  # 主线门禁：真正跑 Drogon 实现。
+  # Drogon 编译很慢（约 10 分钟），靠 GHA 层缓存：Dockerfile 不变时这一层直接命中，
+  # 后续运行只重编应用（约 1 分钟）。
+  smoke-drogon:
+    name: 镜像构建 + 冒烟（Drogon 主线）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: aiplatform:ci
+          build-args: |
+            BUILD_JOBS=2
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 起服务 + 跑 demo.sh 冒烟
+        run: |
+          docker run -d --name aip -p 8080:8080 -e AIP_PROVIDER=mock aiplatform:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz; then break; fi
+            sleep 1
+          done
+          ./scripts/demo.sh http://127.0.0.1:8080
+          docker logs aip
+          docker rm -f aip
+
+      - name: 失败时保留日志
+        if: failure()
+        run: docker logs aip || true

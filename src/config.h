@@ -27,6 +27,12 @@ struct Config {
   int max_history_messages{20};
   int max_sessions{10000};
 
+  // HTTP 层（Drogon 后端；httplib 回退实现只用 heartbeat_s）
+  int io_threads{0};         // 0 = 按核数自动（2~8）
+  int max_streams{512};      // 同时在途 SSE 流上限，超出直接 503
+  int heartbeat_s{15};       // SSE 心跳 / 断连探测周期；最坏取消时延 = 一个周期
+  int shutdown_drain_s{30};  // SIGTERM 后等待在途流的最长时间
+
   static Config from_env();
 
   bool auth_enabled() const { return !api_token.empty(); }

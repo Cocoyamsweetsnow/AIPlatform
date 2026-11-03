@@ -65,6 +65,11 @@ Config Config::from_env() {
   c.max_history_messages = env_int("AIP_MAX_HISTORY", c.max_history_messages);
   c.max_sessions = env_int("AIP_MAX_SESSIONS", c.max_sessions);
 
+  c.io_threads = env_int("AIP_IO_THREADS", c.io_threads);
+  c.max_streams = env_int("AIP_MAX_STREAMS", c.max_streams);
+  c.heartbeat_s = env_int("AIP_HEARTBEAT_S", c.heartbeat_s);
+  c.shutdown_drain_s = env_int("AIP_SHUTDOWN_DRAIN_S", c.shutdown_drain_s);
+
   // 去掉 base_url 末尾的 '/'，避免拼出双斜杠
   while (!c.base_url.empty() && c.base_url.back() == '/') c.base_url.pop_back();
 
@@ -72,6 +77,17 @@ Config Config::from_env() {
   if (c.max_tokens <= 0) throw std::runtime_error("AIP_MAX_TOKENS 必须为正数");
   if (c.temperature < 0.0 || c.temperature > 2.0) {
     throw std::runtime_error("AIP_TEMPERATURE 应在 [0, 2] 区间");
+  }
+  if (c.io_threads < 0 || c.io_threads > 64) {
+    throw std::runtime_error("AIP_IO_THREADS 应在 [0, 64]（0 表示按核数自动）");
+  }
+  if (c.max_streams <= 0) throw std::runtime_error("AIP_MAX_STREAMS 必须为正数");
+  // 心跳太短会浪费带宽，太长会让「客户端断开」迟迟发现不了（最坏 = 一个心跳周期）。
+  if (c.heartbeat_s < 1 || c.heartbeat_s > 300) {
+    throw std::runtime_error("AIP_HEARTBEAT_S 应在 [1, 300] 秒");
+  }
+  if (c.shutdown_drain_s < 0 || c.shutdown_drain_s > 600) {
+    throw std::runtime_error("AIP_SHUTDOWN_DRAIN_S 应在 [0, 600] 秒");
   }
   if (c.provider != "mock" && c.provider != "openai") {
     throw std::runtime_error("AIP_PROVIDER 只支持 mock 或 openai，当前值: " + c.provider);

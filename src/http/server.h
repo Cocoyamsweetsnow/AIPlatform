@@ -1,15 +1,20 @@
+// HTTP 层对外接口：与具体框架解耦（PIMPL）。
+//
+// 用哪个框架由 CMake 的 AIPLATFORM_HTTP 决定（默认 drogon，回退 httplib）：
+//   - src/http/server_drogon.cpp   ← 主线，见 docs/adr/0001-http-framework.md
+//   - src/http/server_httplib.cpp  ← 回退实现，API 契约完全一致
+// 业务层（llm/ chat/）不感知 HTTP 框架，两个实现都用同一套 ChatService。
 #pragma once
 
-#include <string>
+#include <cstddef>
+#include <memory>
 
 #include "chat/chat_service.h"
 #include "chat/session_store.h"
 #include "config.h"
-#include "httplib.h"
 
 namespace http {
 
-// HTTP 层：解析请求、鉴权、SSE 编码、错误码。业务全在 ChatService。
 class ApiServer {
  public:
   ApiServer(const platform::Config& config, chat::ChatService& service,
@@ -19,21 +24,19 @@ class ApiServer {
   ApiServer(const ApiServer&) = delete;
   ApiServer& operator=(const ApiServer&) = delete;
 
-  /// 阻塞运行，直到 stop() 被调用。
+  /// 阻塞运行，直到收到 SIGINT/SIGTERM 或 stop()。
+  /// 收到信号后先停止接收新的对话请求，再等待在途流收尾（最长 shutdown_drain_s）。
   bool run();
   void stop();
 
   bool is_running() const;
 
- private:
-  void setup_routes();
-  void handle_chat(const httplib::Request& req, httplib::Response& res);
-  void handle_history(const httplib::Request& req, httplib::Response& res);
+  /// 当前在途的 SSE 流数量（/healthz 用来判断是否打满）。
+  std::size_t active_streams() const;
 
-  const platform::Config& config_;
-  chat::ChatService& service_;
-  chat::SessionStore& store_;
-  httplib::Server server_;
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace http

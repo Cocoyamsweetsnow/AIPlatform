@@ -1,20 +1,39 @@
+// HTTP 层实现之一：cpp-httplib（回退实现，默认不编译）。
+//
+// 为什么保留：ADR 0001 把 httplib 定为回退项——Drogon 装不上（客户机房、国产化
+// OS）或依赖出问题时，用 -DAIPLATFORM_HTTP=httplib 仍能构建出功能一致的二进制。
+//
+// 已知限制（与 Drogon 实现的差异，见 docs/adr/0001-http-framework.md）：
+//   - 每连接一线程：并发流上限 = CPPHTTPLIB_THREAD_POOL_COUNT（CMake 里设为 64）；
+//   - 没有流数量准入控制（线程池本身就是上限），超额请求只会排队；
+//   - 退出只停止 accept，不等待在途流（drain 只在 Drogon 实现里做）。
+
 #include "http/server.h"
 
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <memory>
 #include <string>
 #include <utility>
 
 #include "common/log.h"
+#include "httplib.h"
 #include "util/id.h"
 
 namespace http {
 namespace {
 
 using json = nlohmann::json;
+
+// 信号处理里只能调用 async-signal-safe 的东西，所以只存一个裸指针。
+std::atomic<httplib::Server*> g_signal_target{nullptr};
+
+void on_signal(int) {
+  if (auto* server = g_signal_target.load()) server->stop();
+}
 
 std::string json_error(const std::string& type, const std::string& message) {
   return json{{"error", {{"type", type}, {"message", message}}}}.dump();
@@ -63,45 +82,39 @@ struct SseState {
 
 }  // namespace
 
-ApiServer::ApiServer(const platform::Config& config, chat::ChatService& service,
-                     chat::SessionStore& store)
-    : config_(config), service_(service), store_(store) {
-  setup_routes();
-}
-
-ApiServer::~ApiServer() = default;
-
-bool ApiServer::run() {
-  platform::log_info("HTTP 服务启动: http://" + config_.host + ":" +
-                     std::to_string(config_.port));
-  if (config_.auth_enabled()) {
-    platform::log_info("已启用 Bearer Token 鉴权（AIP_TOKEN）");
-  } else {
-    platform::log_warn("未设置 AIP_TOKEN：接口无鉴权，请勿直接暴露到公网");
+struct ApiServer::Impl {
+  Impl(const platform::Config& config, chat::ChatService& service, chat::SessionStore& store)
+      : config(config), service(service), store(store) {
+    setup_routes();
   }
-  return server_.listen(config_.host, config_.port);
-}
 
-void ApiServer::stop() { server_.stop(); }
+  void setup_routes();
+  void handle_chat(const httplib::Request& req, httplib::Response& res);
+  void handle_history(const httplib::Request& req, httplib::Response& res);
 
-bool ApiServer::is_running() const { return server_.is_running(); }
+  const platform::Config& config;
+  chat::ChatService& service;
+  chat::SessionStore& store;
+  httplib::Server server;
+  std::atomic<std::size_t> active_streams{0};
+};
 
-void ApiServer::setup_routes() {
-  server_.set_payload_max_length(1024 * 1024);
-  server_.set_read_timeout(30, 0);
-  server_.set_write_timeout(600, 0);
+void ApiServer::Impl::setup_routes() {
+  server.set_payload_max_length(1024 * 1024);
+  server.set_read_timeout(30, 0);
+  server.set_write_timeout(600, 0);
 
-  server_.set_pre_routing_handler(
+  server.set_pre_routing_handler(
       [this](const httplib::Request& req, httplib::Response& res) {
         add_cors(res);
         if (req.method == "OPTIONS") {
           res.status = 204;
           return httplib::Server::HandlerResponse::Handled;
         }
-        if (!config_.auth_enabled() || req.path == "/healthz") {
+        if (!config.auth_enabled() || req.path == "/healthz") {
           return httplib::Server::HandlerResponse::Unhandled;
         }
-        const std::string expected = "Bearer " + config_.api_token;
+        const std::string expected = "Bearer " + config.api_token;
         if (req.get_header_value("Authorization") == expected) {
           return httplib::Server::HandlerResponse::Unhandled;
         }
@@ -109,41 +122,43 @@ void ApiServer::setup_routes() {
         return httplib::Server::HandlerResponse::Handled;
       });
 
-  server_.set_post_routing_handler([](const httplib::Request& req,
-                                      const httplib::Response& res) {
+  server.set_post_routing_handler([](const httplib::Request& req,
+                                     const httplib::Response& res) {
     platform::log_info(req.method + " " + req.path + " -> " + std::to_string(res.status));
   });
 
-  server_.Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
+  server.Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
     res.status = 204;
   });
 
-  server_.Get("/healthz", [this](const httplib::Request&, httplib::Response& res) {
+  server.Get("/healthz", [this](const httplib::Request&, httplib::Response& res) {
     res.set_content(json{{"status", "ok"},
-                         {"sessions", store_.session_count()},
-                         {"model", config_.model},
-                         {"provider", config_.provider}}
+                         {"sessions", store.session_count()},
+                         {"active_streams", active_streams.load()},
+                         {"model", config.model},
+                         {"provider", config.provider},
+                         {"http", "httplib"}}
                         .dump(),
                     "application/json; charset=utf-8");
   });
 
-  server_.Post("/v1/chat/completions",
-               [this](const httplib::Request& req, httplib::Response& res) {
-                 handle_chat(req, res);
-               });
-
-  server_.Get(R"(/v1/sessions/([A-Za-z0-9_\-]+)/messages)",
+  server.Post("/v1/chat/completions",
               [this](const httplib::Request& req, httplib::Response& res) {
-                handle_history(req, res);
+                handle_chat(req, res);
               });
 
-  server_.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+  server.Get(R"(/v1/sessions/([A-Za-z0-9_\-]+)/messages)",
+             [this](const httplib::Request& req, httplib::Response& res) {
+               handle_history(req, res);
+             });
+
+  server.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
     if (res.status == 404) {
       send_error(res, 404, "not_found", "接口不存在: " + req.path);
     }
   });
 
-  server_.set_exception_handler(
+  server.set_exception_handler(
       [](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
         std::string what = "unknown";
         try {
@@ -156,7 +171,7 @@ void ApiServer::setup_routes() {
       });
 }
 
-void ApiServer::handle_chat(const httplib::Request& req, httplib::Response& res) {
+void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response& res) {
   json body;
   try {
     body = json::parse(req.body);
@@ -187,19 +202,39 @@ void ApiServer::handle_chat(const httplib::Request& req, httplib::Response& res)
     return send_error(res, 413, "payload_too_large", "单条消息超过 32KB 限制");
   }
 
-  const std::string session_id = body.value("session_id", "");
-  const std::string model = body.value("model", "");
-  const bool stream = body.value("stream", true);
+  // 逐字段校验类型：body.value() 在字段类型不对时会抛 type_error（→ 500），
+  // 客户端传错类型应该得到 400。
+  std::string session_id;
+  if (body.contains("session_id")) {
+    if (!body["session_id"].is_string()) {
+      return send_error(res, 400, "invalid_request", "session_id 必须是字符串");
+    }
+    session_id = body["session_id"].get<std::string>();
+  }
+  std::string model;
+  if (body.contains("model")) {
+    if (!body["model"].is_string()) {
+      return send_error(res, 400, "invalid_request", "model 必须是字符串");
+    }
+    model = body["model"].get<std::string>();
+  }
+  bool stream = true;
+  if (body.contains("stream")) {
+    if (!body["stream"].is_boolean()) {
+      return send_error(res, 400, "invalid_request", "stream 必须是布尔值");
+    }
+    stream = body["stream"].get<bool>();
+  }
 
   chat::ChatService::Turn turn;
   try {
-    turn = service_.start(session_id, user_text, model);
+    turn = service.start(session_id, user_text, model);
   } catch (const std::exception& e) {
     platform::log_error(std::string("启动对话失败: ") + e.what());
     return send_error(res, 502, "upstream_error", "无法连接模型服务");
   }
 
-  const std::string model_name = model.empty() ? config_.model : model;
+  const std::string model_name = model.empty() ? config.model : model;
   res.set_header("X-Session-Id", turn.session_id);
 
   if (!stream) {
@@ -210,7 +245,7 @@ void ApiServer::handle_chat(const httplib::Request& req, httplib::Response& res)
     int completion_tokens = -1;
 
     const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(config_.request_timeout_s);
+                          std::chrono::seconds(config.request_timeout_s);
     while (std::chrono::steady_clock::now() < deadline) {
       llm::Event ev;
       const llm::Pull pull = turn.stream->next(ev, std::chrono::seconds(5));
@@ -264,11 +299,13 @@ void ApiServer::handle_chat(const httplib::Request& req, httplib::Response& res)
   res.set_header("Cache-Control", "no-cache, no-transform");
   res.set_header("X-Accel-Buffering", "no");  // 关闭 Nginx 缓冲，否则前端会一次性收到全部内容
 
+  active_streams.fetch_add(1);
   res.set_chunked_content_provider(
       "text/event-stream",
-      [state](std::size_t /*offset*/, httplib::DataSink& sink) -> bool {
+      [state, this](std::size_t /*offset*/, httplib::DataSink& sink) -> bool {
         llm::Event ev;
-        const llm::Pull pull = state->stream->next(ev, std::chrono::seconds(15));
+        const llm::Pull pull =
+            state->stream->next(ev, std::chrono::seconds(config.heartbeat_s));
 
         if (pull == llm::Pull::Timeout) {
           const std::string ping = ": keep-alive\n\n";
@@ -333,15 +370,16 @@ void ApiServer::handle_chat(const httplib::Request& req, httplib::Response& res)
         if (terminal) sink.done();
         return ok;
       },
-      [state](bool /*success*/) {
+      [state, this](bool /*success*/) {
         // 响应结束（含客户端断开）时释放上游连接。
         state->stream->cancel();
+        active_streams.fetch_sub(1);
       });
 }
 
-void ApiServer::handle_history(const httplib::Request& req, httplib::Response& res) {
+void ApiServer::Impl::handle_history(const httplib::Request& req, httplib::Response& res) {
   const std::string session_id = req.matches[1];
-  const auto messages = store_.history(session_id, 100);
+  const auto messages = store.history(session_id, 100);
 
   json list = json::array();
   for (const auto& m : messages) {
@@ -350,5 +388,35 @@ void ApiServer::handle_history(const httplib::Request& req, httplib::Response& r
   res.set_content(json{{"session_id", session_id}, {"messages", list}}.dump(),
                   "application/json; charset=utf-8");
 }
+
+ApiServer::ApiServer(const platform::Config& config, chat::ChatService& service,
+                     chat::SessionStore& store)
+    : impl_(std::make_unique<Impl>(config, service, store)) {}
+
+ApiServer::~ApiServer() = default;
+
+bool ApiServer::run() {
+  platform::log_info("HTTP 服务启动（httplib 回退实现）: http://" + impl_->config.host + ":" +
+                     std::to_string(impl_->config.port));
+  if (impl_->config.auth_enabled()) {
+    platform::log_info("已启用 Bearer Token 鉴权（AIP_TOKEN）");
+  } else {
+    platform::log_warn("未设置 AIP_TOKEN：接口无鉴权，请勿直接暴露到公网");
+  }
+
+  g_signal_target.store(&impl_->server);
+  std::signal(SIGINT, on_signal);
+  std::signal(SIGTERM, on_signal);
+
+  const bool ok = impl_->server.listen(impl_->config.host, impl_->config.port);
+  g_signal_target.store(nullptr);
+  return ok;
+}
+
+void ApiServer::stop() { impl_->server.stop(); }
+
+bool ApiServer::is_running() const { return impl_->server.is_running(); }
+
+std::size_t ApiServer::active_streams() const { return impl_->active_streams.load(); }
 
 }  // namespace http

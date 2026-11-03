@@ -2,12 +2,17 @@
 """SSE 并发冒烟压测：只用标准库，不需要装 k6 / wrk。
 
 用法：
-    # 1) 真实链路：200 路 /sse（每路 2 个服务端线程：泵 + 上游读线程）
+    # 1) 真实链路（主线接口）：200 路 POST /v1/chat/completions
+    python3 scripts/sse_load.py -n 200 \
+        --path /v1/chat/completions --body '{"message":"压测"}' \
+        --pid "$(docker inspect -f '{{.State.Pid}}' aip-drogon-test)"
+
+    # 2) 纯连接：500 路保持 5 秒（线程数应基本不涨，测的是「连接不占线程」）
+    python3 scripts/sse_load.py -n 500 --path /healthz --hold 5 --pid <pid>
+
+    # 3) POC（旧）：200 路 /sse
     ./build-poc/poc_drogon_sse 8081
     python3 scripts/sse_load.py -n 200 --pid "$(pgrep -f poc_drogon_sse)"
-
-    # 2) 纯连接：500 路 /idle，保持 5 秒（线程数应基本不涨）
-    python3 scripts/sse_load.py -n 500 --path /idle --hold 5 --pid "$(pgrep -f poc_drogon_sse)"
 
 判据见 docs/POC-DROGON.md。退出码：0 = 全部成功，1 = 有失败。
 
@@ -32,7 +37,7 @@ def percentile(values, p):
     return ordered[max(0, min(len(ordered) - 1, k))]
 
 
-def run_one(host, port, path, timeout, hold, barrier, results, idx):
+def run_one(host, port, path, timeout, hold, barrier, results, idx, method="GET", body=None):
     sock = None
     start = None
     try:
@@ -40,12 +45,20 @@ def run_one(host, port, path, timeout, hold, barrier, results, idx):
         sock.settimeout(timeout)
         barrier.wait(timeout=timeout)
 
+        payload = b""
+        lines = [
+            "{} {} HTTP/1.1".format(method, path),
+            "Host: {}:{}".format(host, port),
+            "Accept: text/event-stream",
+        ]
+        if body is not None:
+            payload = body.encode("utf-8")
+            lines.append("Content-Type: application/json")
+            lines.append("Content-Length: {}".format(len(payload)))
+        request = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + payload
+
         start = time.perf_counter()
-        sock.sendall(
-            "GET {} HTTP/1.1\r\nHost: {}:{}\r\nAccept: text/event-stream\r\n\r\n".format(
-                path, host, port
-            ).encode()
-        )
+        sock.sendall(request)
 
         buf = b""
         head_end = -1
@@ -159,7 +172,19 @@ def main():
         help="收到首帧后保持连接 N 秒再断开（测 /idle 这类不结束的流）",
     )
     parser.add_argument("--pid", type=int, default=0, help="服务端 pid，用于采样 RSS / 线程数")
+    parser.add_argument(
+        "--method",
+        default=None,
+        help="请求方法；默认 GET，给了 --body 时默认 POST",
+    )
+    parser.add_argument(
+        "--body",
+        default=None,
+        help="请求体（JSON 字符串），用来打 POST /v1/chat/completions",
+    )
     args = parser.parse_args()
+
+    method = args.method or ("POST" if args.body is not None else "GET")
 
     parsed = urllib.parse.urlsplit(args.base)
     if parsed.scheme != "http":
@@ -177,7 +202,18 @@ def main():
     threads = [
         threading.Thread(
             target=run_one,
-            args=(host, port, args.path, args.timeout, args.hold, barrier, results, i),
+            args=(
+                host,
+                port,
+                args.path,
+                args.timeout,
+                args.hold,
+                barrier,
+                results,
+                i,
+                method,
+                args.body,
+            ),
             daemon=True,
         )
         for i in range(args.connections)
