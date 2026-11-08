@@ -928,6 +928,7 @@
     dom.statusDot.className = "status-dot";
     if (kind === "online") dom.statusDot.classList.add("is-online");
     else if (kind === "draining") dom.statusDot.classList.add("is-draining");
+    else if (kind === "degraded") dom.statusDot.classList.add("is-draining");
     else if (kind === "offline") dom.statusDot.classList.add("is-offline");
     else dom.statusDot.classList.add("is-pending");
 
@@ -937,11 +938,25 @@
       if (kind === "draining") dom.livePill.classList.add("is-draining");
     }
 
-    var labels = { online: "服务正常", draining: "正在排空", offline: "服务离线", pending: "正在连接…" };
+    var labels = {
+      online: "服务正常",
+      draining: "正在排空",
+      degraded: "存储异常",
+      offline: "服务离线",
+      pending: "正在连接…"
+    };
     if (dom.statusText) dom.statusText.textContent = labels[kind] || labels.pending;
     if (dom.liveText) {
       dom.liveText.textContent =
-        kind === "online" ? "在线" : kind === "draining" ? "排空" : kind === "offline" ? "离线" : "连接中";
+        kind === "online"
+          ? "在线"
+          : kind === "draining"
+            ? "排空"
+            : kind === "degraded"
+              ? "异常"
+              : kind === "offline"
+                ? "离线"
+                : "连接中";
     }
   }
 
@@ -949,9 +964,20 @@
     var model = (state.config && state.config.model) || (state.health && state.health.model) || "mock";
     if (dom.modelPill) dom.modelPill.textContent = model;
     if (dom.footerModel) dom.footerModel.textContent = model;
+    var storage =
+      (state.config && state.config.storage) || (state.health && state.health.storage) || "memory";
+    if (dom.footerStorage) {
+      dom.footerStorage.textContent =
+        storage === "postgres" ? "PostgreSQL 持久化" : "服务端内存会话重启即失效";
+    }
 
     if (state.health) {
-      var status = state.health.status === "draining" ? "draining" : "online";
+      var status =
+        state.health.status === "draining"
+          ? "draining"
+          : state.health.storage_ok === false
+            ? "degraded"
+            : "online";
       setStatus(status);
       if (dom.statusMeta) {
         var streams =
@@ -1004,6 +1030,11 @@
     }
     if (dom.infoBackend) {
       dom.infoBackend.textContent = state.config ? state.config.http || "—" : "—";
+    }
+    if (dom.infoStorage) {
+      dom.infoStorage.textContent = state.config
+        ? (state.config.storage === "postgres" ? "PostgreSQL" : "内存（重启即丢）")
+        : "—";
     }
     if (dom.infoVersion) {
       dom.infoVersion.textContent = state.config ? state.config.version || "—" : "—";
@@ -1750,6 +1781,7 @@
     dom.liveText = $("#liveText");
     dom.modelPill = $("#modelPill");
     dom.footerModel = $("#footerModel");
+    dom.footerStorage = $("#footerStorage");
     dom.authBanner = $("#authBanner");
     dom.bannerTokenBtn = $("#bannerTokenBtn");
     dom.offlineBanner = $("#offlineBanner");
@@ -1778,6 +1810,7 @@
     dom.infoEndpoint = $("#infoEndpoint");
     dom.infoModel = $("#infoModel");
     dom.infoBackend = $("#infoBackend");
+    dom.infoStorage = $("#infoStorage");
     dom.infoVersion = $("#infoVersion");
   }
 

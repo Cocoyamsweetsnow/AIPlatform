@@ -194,7 +194,7 @@
           <svg class="icon banner-icon"><use href="#i-key"></use></svg>
           <div class="banner-copy">
             <strong>此服务已启用访问鉴权</strong>
-            <span>填写 <code>AIP_TOKEN</code> 对应的 Token 后才能开始对话。</span>
+            <span>填写 JWT、API Key 或静态 <code>AIP_TOKEN</code> 后才能开始对话。</span>
           </div>
           <button class="btn btn-small" id="bannerTokenBtn" type="button">填写 Token</button>
         </div>
@@ -292,7 +292,8 @@
           </div>
         </div>
         <p class="disclaimer">
-          AI 生成内容仅供参考 · 当前模型 <span id="footerModel">mock</span> · 服务端内存会话重启即失效
+          AI 生成内容仅供参考 · 当前模型 <span id="footerModel">mock</span> ·
+          <span id="footerStorage">服务端会话重启即失效</span>
         </p>
       </footer>
     </main>
@@ -313,9 +314,9 @@
       <div class="dialog-body">
         <section class="setting-group">
           <label class="setting-label" for="tokenInput">访问 Token</label>
-          <p class="setting-help">服务端设置 <code>AIP_TOKEN</code> 时必填。仅保存在 localStorage，不会发送到其他域名。</p>
+          <p class="setting-help">服务端启用鉴权时必填；支持 JWT、API Key 或静态 <code>AIP_TOKEN</code>。仅保存在 localStorage，不会发送到其他域名。</p>
           <div class="token-row">
-            <input id="tokenInput" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴 Bearer Token（未启用鉴权可留空）" />
+            <input id="tokenInput" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴 JWT / API Key / 静态 Token（未启用鉴权可留空）" />
             <button class="text-btn" id="toggleTokenBtn" type="button">显示</button>
           </div>
           <div class="auth-state" id="authState">当前服务未启用鉴权</div>
@@ -336,6 +337,7 @@
             <div><dt>接口地址</dt><dd id="infoEndpoint">-</dd></div>
             <div><dt>模型 / 提供方</dt><dd id="infoModel">-</dd></div>
             <div><dt>HTTP 后端</dt><dd id="infoBackend">-</dd></div>
+            <div><dt>会话存储</dt><dd id="infoStorage">-</dd></div>
             <div><dt>版本</dt><dd id="infoVersion">-</dd></div>
           </dl>
         </section>
