@@ -27,6 +27,29 @@ else()
   set(CURL_TARGET CURL::libcurl)
 endif()
 
+# ---- PostgreSQL 持久化后端（可选）--------------------------------------
+# 只依赖客户端运行库 libpq.so.5；头文件随仓库分发到 third_party/libpq/include，
+# 因此目标机器不需要 libpq-dev（见 third_party/libpq/README.md）。
+# 没有 libpq 的交付环境可以用 -DAIPLATFORM_WITH_POSTGRES=OFF 退回纯内存模式。
+option(AIPLATFORM_WITH_POSTGRES "Build the PostgreSQL storage backend" ON)
+if(AIPLATFORM_WITH_POSTGRES)
+  find_library(PQ_LIBRARY NAMES pq)
+  if(NOT PQ_LIBRARY)
+    find_file(PQ_LIBPQ_SO NAMES libpq.so.5
+      PATHS /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib /usr/local/lib)
+    if(PQ_LIBPQ_SO)
+      set(PQ_LIBRARY "${PQ_LIBPQ_SO}")
+    endif()
+  endif()
+  if(NOT PQ_LIBRARY)
+    message(FATAL_ERROR
+      "找不到 libpq。请安装 libpq5（运行时）或 libpq-dev（开发包），"
+      "或者用 -DAIPLATFORM_WITH_POSTGRES=OFF 构建纯内存版本。")
+  endif()
+  set(AIP_PQ_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libpq/include")
+  message(STATUS "PostgreSQL storage: ${PQ_LIBRARY}")
+endif()
+
 # ---- HTTP 后端（决策见 docs/adr/0001-http-framework.md）------------------
 # drogon  ：主线。连接不占线程，SSE 并发只受 max_streams 与线程数约束。
 # httplib ：回退项。Drogon 装不上（客户机房 / 国产化 OS）时仍能构建，
@@ -34,15 +57,62 @@ endif()
 set(AIPLATFORM_HTTP "drogon" CACHE STRING "HTTP backend: drogon (default) or httplib")
 set_property(CACHE AIPLATFORM_HTTP PROPERTY STRINGS drogon httplib)
 
+# ---- 用户鉴权（JWT + Argon2id + API Key）--------------------------------
+# Argon2id 只依赖 libargon2.so.1；头文件随仓库分发在 third_party/argon2/include。
+option(AIPLATFORM_WITH_AUTH "Build user auth (JWT/Argon2id/API keys)" ON)
+if(AIPLATFORM_WITH_AUTH)
+  find_library(ARGON2_LIBRARY NAMES argon2)
+  if(NOT ARGON2_LIBRARY)
+    find_file(ARGON2_SO NAMES libargon2.so.1
+      PATHS /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib /usr/local/lib)
+    if(ARGON2_SO)
+      set(ARGON2_LIBRARY "${ARGON2_SO}")
+    endif()
+  endif()
+  if(NOT ARGON2_LIBRARY)
+    message(FATAL_ERROR
+      "找不到 libargon2。请安装 libargon2-1（运行时）或 libargon2-dev，"
+      "或者用 -DAIPLATFORM_WITH_AUTH=OFF 只保留静态 Token。")
+  endif()
+  set(AIP_ARGON2_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/include")
+  find_package(OpenSSL REQUIRED)
+  message(STATUS "User auth: Argon2 ${ARGON2_LIBRARY}, OpenSSL ${OPENSSL_VERSION}")
+endif()
+
 # ---- 核心库 -------------------------------------------------------------
-add_library(ai_core STATIC
+set(AIP_CORE_SOURCES
   src/config.cpp
   src/util/id.cpp
   src/llm/mock_provider.cpp
   src/llm/openai_provider.cpp
   src/chat/session_store.cpp
   src/chat/chat_service.cpp
+  src/chat/token_estimate.cpp
+  src/chat/context_builder.cpp
+  src/chat/idempotency.cpp
+  src/quota/quota.cpp
 )
+if(AIPLATFORM_WITH_POSTGRES)
+  list(APPEND AIP_CORE_SOURCES
+    src/storage/db.cpp
+    src/storage/migrations.cpp
+    src/chat/pg_session_store.cpp
+    src/chat/pg_idempotency_store.cpp
+    src/usage/pg_usage_sink.cpp
+  )
+endif()
+if(AIPLATFORM_WITH_AUTH)
+  list(APPEND AIP_CORE_SOURCES
+    src/auth/password_hasher.cpp
+    src/auth/jwt.cpp
+    src/auth/api_key.cpp
+    src/auth/auth_service.cpp
+  )
+  if(AIPLATFORM_WITH_POSTGRES)
+    list(APPEND AIP_CORE_SOURCES src/auth/pg_user_store.cpp)
+  endif()
+endif()
+add_library(ai_core STATIC ${AIP_CORE_SOURCES})
 
 # ---- Web UI（编译期嵌入二进制）-----------------------------------------
 # 前端保持「零构建」：没有 npm / node_modules，源码直接进二进制，部署仍是一个可执行文件。
@@ -76,6 +146,18 @@ target_include_directories(ai_core PUBLIC
 target_link_libraries(ai_core PUBLIC ${CURL_TARGET} Threads::Threads)
 target_compile_definitions(ai_core PUBLIC AIP_VERSION="${PROJECT_VERSION}")
 
+if(AIPLATFORM_WITH_POSTGRES)
+  target_include_directories(ai_core PUBLIC ${AIP_PQ_INCLUDE_DIR})
+  target_link_libraries(ai_core PUBLIC ${PQ_LIBRARY})
+  target_compile_definitions(ai_core PUBLIC AIP_WITH_POSTGRES=1)
+endif()
+
+if(AIPLATFORM_WITH_AUTH)
+  target_include_directories(ai_core PUBLIC ${AIP_ARGON2_INCLUDE_DIR})
+  target_link_libraries(ai_core PUBLIC ${ARGON2_LIBRARY} OpenSSL::Crypto)
+  target_compile_definitions(ai_core PUBLIC AIP_WITH_AUTH=1)
+endif()
+
 if(AIPLATFORM_HTTP STREQUAL "drogon")
   # Drogon 必须 >= 1.9.14：newAsyncStreamResponse 在 1.9.0 里还不存在。
   find_package(Drogon CONFIG REQUIRED)
@@ -104,6 +186,35 @@ if(AIPLATFORM_BUILD_TESTS)
   add_executable(unit_tests tests/unit_tests.cpp)
   target_link_libraries(unit_tests PRIVATE ai_core)
   add_test(NAME unit_tests COMMAND unit_tests)
+
+  add_executable(usage_tests tests/usage_tests.cpp)
+  target_link_libraries(usage_tests PRIVATE ai_core)
+  add_test(NAME usage_tests COMMAND usage_tests)
+
+  add_executable(quota_tests tests/quota_tests.cpp)
+  target_link_libraries(quota_tests PRIVATE ai_core)
+  add_test(NAME quota_tests COMMAND quota_tests)
+
+  add_executable(idempotency_tests tests/idempotency_tests.cpp)
+  target_link_libraries(idempotency_tests PRIVATE ai_core)
+  add_test(NAME idempotency_tests COMMAND idempotency_tests)
+
+  add_executable(context_tests tests/context_tests.cpp)
+  target_link_libraries(context_tests PRIVATE ai_core)
+  add_test(NAME context_tests COMMAND context_tests)
+
+  if(AIPLATFORM_WITH_POSTGRES)
+    # 需要 AIP_TEST_PG_DSN；没有设置时测试内部直接 skip（CI 里会起 postgres service）。
+    add_executable(pg_tests tests/pg_tests.cpp)
+    target_link_libraries(pg_tests PRIVATE ai_core)
+    add_test(NAME pg_tests COMMAND pg_tests)
+  endif()
+
+  if(AIPLATFORM_WITH_AUTH)
+    add_executable(auth_tests tests/auth_tests.cpp)
+    target_link_libraries(auth_tests PRIVATE ai_core)
+    add_test(NAME auth_tests COMMAND auth_tests)
+  endif()
 endif()
 
 # ---- Drogon SSE POC（可选，决策见 docs/adr/0001） ------------------------

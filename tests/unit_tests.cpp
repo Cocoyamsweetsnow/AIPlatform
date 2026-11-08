@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "auth/principal.h"
 #include "chat/chat_service.h"
 #include "chat/session_store.h"
 #include "config.h"
@@ -59,8 +60,8 @@ void test_queue_cancel_drops_pending() {
 }
 
 void test_session_store_trim() {
-  chat::SessionStore store(/*max_messages=*/3, /*max_sessions=*/2);
-  const std::string id = store.create();
+  chat::MemorySessionStore store(/*max_messages=*/3, /*max_sessions=*/2);
+  const std::string id = store.create(/*user_id=*/0, "测试", "mock");
   CHECK(store.exists(id));
 
   for (int i = 0; i < 5; ++i) {
@@ -79,15 +80,46 @@ void test_session_store_trim() {
 }
 
 void test_session_store_lru_eviction() {
-  chat::SessionStore store(10, /*max_sessions=*/2);
-  const std::string a = store.create();
-  const std::string b = store.create();
+  chat::MemorySessionStore store(10, /*max_sessions=*/2);
+  const std::string a = store.create(0, "a", "mock");
+  const std::string b = store.create(0, "b", "mock");
   CHECK(store.session_count() == 2);
   (void)a;
   (void)b;
   // 第三个会话会淘汰最旧的
-  store.create();
+  store.create(0, "c", "mock");
   CHECK(store.session_count() == 2);
+}
+
+void test_session_metadata_and_ownership() {
+  chat::MemorySessionStore store;
+  const std::string a = store.create(/*user_id=*/7, "标题", "model-a");
+  CHECK(store.owns(7, false, a));
+  CHECK(!store.owns(8, false, a));
+  CHECK(store.owns(8, true, a));  // admin 可以访问所有会话
+
+  const auto info = store.get(a);
+  CHECK(info.has_value());
+  if (info.has_value()) {
+    CHECK(info->user_id == 7);
+    CHECK(info->title == "标题");
+    CHECK(info->model == "model-a");
+    CHECK(info->message_count == 0);
+  }
+
+  CHECK(store.rename(8, false, a, "越权") == false);
+  CHECK(store.rename(7, false, a, "新标题") == true);
+  CHECK(store.get(a)->title == "新标题");
+
+  const auto own = store.list(7, false, 10, 0);
+  CHECK(own.size() == 1);
+  const auto other = store.list(8, false, 10, 0);
+  CHECK(other.empty());
+  CHECK(store.list(8, true, 10, 0).size() == 1);
+
+  CHECK(store.remove(8, false, a) == false);
+  CHECK(store.remove(7, false, a) == true);
+  CHECK(!store.exists(a));
 }
 
 std::string drain(llm::Stream& stream, int* prompt_tokens = nullptr) {
@@ -125,12 +157,15 @@ void test_mock_provider_streams() {
 
 void test_chat_service_records_history() {
   auto provider = llm::make_mock_provider();
-  chat::SessionStore store;
+  chat::MemorySessionStore store;
   chat::ChatOptions options;
   options.system_prompt = "system";
   chat::ChatService service(*provider, store, options);
 
-  auto turn = service.start({}, "第一句话");
+  auth::Principal principal;
+  principal.user_id = 0;
+  principal.is_admin = true;
+  auto turn = service.start(principal, {}, "第一句话");
   CHECK(!turn.session_id.empty());
   const std::string reply = drain(*turn.stream);
   CHECK(!reply.empty());
@@ -242,6 +277,7 @@ void test_public_config_has_no_secrets() {
   CHECK(parsed["auth_required"] == true);
   CHECK(parsed["model"] == "demo-model");
   CHECK(parsed["http"] == "httplib");
+  CHECK(parsed["storage"] == "memory");
   CHECK(parsed["web"] == true);
   // 公开接口绝不能带上密钥、上游地址或 system prompt。
   CHECK(body.find("sk-should-not-leak") == std::string::npos);
@@ -257,6 +293,7 @@ int main() {
   test_queue_cancel_drops_pending();
   test_session_store_trim();
   test_session_store_lru_eviction();
+  test_session_metadata_and_ownership();
   test_mock_provider_streams();
   test_chat_service_records_history();
   test_cancel_is_idempotent();

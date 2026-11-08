@@ -21,19 +21,34 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "auth/principal.h"
+#include "chat/errors.h"
+#include "chat/replay_stream.h"
+#include "chat/token_estimate.h"
 #include "common/log.h"
+#include "http/auth_json.h"
 #include "http/public_config.h"
+#include "http/session_json.h"
 #include "util/id.h"
 #include "web/assets.h"
+#ifdef AIP_WITH_AUTH
+#include "auth/api_key.h"
+#endif
+#ifdef AIP_WITH_POSTGRES
+#include "storage/db.h"
+#endif
 
 namespace http {
 namespace {
@@ -104,7 +119,19 @@ HttpResponsePtr asset_response(const web::Asset& asset) {
 // 对话与历史接口仍然走鉴权。
 bool is_public_path(const platform::Config& config, const std::string& path) {
   if (path == "/healthz" || path == "/v1/config") return true;
+  if (path == "/v1/auth/register" || path == "/v1/auth/login" ||
+      path == "/v1/auth/refresh") {
+    return true;
+  }
   return config.web_enabled && web::is_public_asset(path);
+}
+
+bool token_equals(const std::string& a, const std::string& b) {
+#ifdef AIP_WITH_AUTH
+  return auth::secure_equals(a, b);
+#else
+  return a == b;
+#endif
 }
 
 void add_cors(const HttpResponsePtr& resp) {
@@ -112,6 +139,28 @@ void add_cors(const HttpResponsePtr& resp) {
   resp->addHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
   resp->addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   resp->addHeader("Access-Control-Expose-Headers", "X-Session-Id");
+}
+
+HttpResponsePtr quota_error(const quota::QuotaDecision& decision) {
+  auto resp = error_response(drogon::k429TooManyRequests, decision.type, decision.message);
+  resp->addHeader("Retry-After", std::to_string(std::max(1, decision.retry_after_s)));
+  return resp;
+}
+
+int estimate_request_tokens(const std::string& text, int max_tokens) {
+  return chat::estimate_tokens(text) + std::max(0, max_tokens) + 8;
+}
+
+HttpResponsePtr idempotency_busy_response() {
+  auto resp = error_response(drogon::k409Conflict, "request_in_progress",
+                             "相同 request_id 的请求正在处理中，请稍后重试");
+  resp->addHeader("Retry-After", "1");
+  return resp;
+}
+
+HttpResponsePtr idempotency_conflict_response() {
+  return error_response(drogon::k409Conflict, "idempotency_conflict",
+                        "该 request_id 已完成，但原始回复已不可用");
 }
 
 std::string sse_pack(const std::string& payload, const std::string& event = {}) {
@@ -434,13 +483,20 @@ std::size_t default_worker_count() {
 }  // namespace
 
 struct ApiServer::Impl {
-  Impl(const platform::Config& config, chat::ChatService& service, chat::SessionStore& store)
+  Impl(const platform::Config& config, chat::ChatService& service, chat::SessionStore& store,
+       auth::AuthService* auth, quota::QuotaService* quota_service,
+       usage::UsageSink* usage_sink, chat::IdempotencyStore* idempotency)
       : config(config),
         service(service),
         store(store),
+        auth_(auth),
+        quota_(quota_service),
+        usage_(usage_sink),
+        idempotency_(idempotency),
         heartbeat(std::chrono::seconds(std::max(1, config.heartbeat_s))),
         max_streams(static_cast<std::size_t>(std::max(1, config.max_streams))),
-        workers(default_worker_count(), kNonStreamQueueSize) {}
+        workers(default_worker_count(), kNonStreamQueueSize),
+        db_workers(4, kNonStreamQueueSize * 2) {}
 
   void setup();
   bool run();
@@ -452,23 +508,41 @@ struct ApiServer::Impl {
                                     std::string model, std::shared_ptr<StreamSlot> slot);
   void pre_routing(const HttpRequestPtr& req, drogon::AdviceCallback&& callback,
                    drogon::AdviceChainCallback&& chain);
+  auth::Principal principal_from(const HttpRequestPtr& req) const;
   void handle_chat(const HttpRequestPtr& req, ResponseCallback&& callback);
-  void handle_non_stream(const std::string& session_id, const std::string& user_text,
-                         const std::string& model, const std::string& model_name,
+  void handle_non_stream(const auth::Principal& principal, const std::string& session_id,
+                         const std::string& user_text, const std::string& model,
+                         const std::string& model_name, const std::string& request_id,
                          const std::shared_ptr<ResponseCallback>& callback);
   void handle_history(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_sessions_list(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_session_update(const HttpRequestPtr& req, ResponseCallback&& callback);
   void handle_static(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_register(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_login(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_refresh(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_me(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_list_api_keys(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_create_api_key(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_delete_api_key(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void post_auth_error(const std::shared_ptr<ResponseCallback>& callback,
+                       const auth::AuthError& error);
   void post(const std::shared_ptr<ResponseCallback>& callback, HttpResponsePtr resp);
 
   const platform::Config& config;
   chat::ChatService& service;
   chat::SessionStore& store;
+  auth::AuthService* auth_ = nullptr;
+  quota::QuotaService* quota_ = nullptr;
+  usage::UsageSink* usage_ = nullptr;
+  chat::IdempotencyStore* idempotency_ = nullptr;
   const std::chrono::milliseconds heartbeat;
   const std::size_t max_streams;
 
   StreamGate gate;
   PumpRegistry pumps;
   WorkerPool workers;
+  WorkerPool db_workers;
   std::atomic<bool> shutting_down{false};
 };
 
@@ -521,6 +595,58 @@ void ApiServer::Impl::setup() {
       },
       {drogon::Get});
 
+#ifdef AIP_WITH_AUTH
+  drogon::app().registerHandler(
+      "/v1/auth/register",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_register(req, std::move(callback));
+      },
+      {drogon::Post});
+
+  drogon::app().registerHandler(
+      "/v1/auth/login",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_login(req, std::move(callback));
+      },
+      {drogon::Post});
+
+  drogon::app().registerHandler(
+      "/v1/auth/refresh",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_refresh(req, std::move(callback));
+      },
+      {drogon::Post});
+
+  drogon::app().registerHandler(
+      "/v1/auth/me",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_me(req, std::move(callback));
+      },
+      {drogon::Get});
+
+  drogon::app().registerHandler(
+      "/v1/auth/api-keys",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_list_api_keys(req, std::move(callback));
+      },
+      {drogon::Get});
+
+  drogon::app().registerHandler(
+      "/v1/auth/api-keys",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_create_api_key(req, std::move(callback));
+      },
+      {drogon::Post});
+
+  drogon::app().registerHandlerViaRegex(
+      R"(/v1/auth/api-keys/([0-9]+))",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_delete_api_key(req, std::move(callback));
+      },
+      {drogon::Delete});
+
+#endif
+
   // 内置 Web UI：首页与静态资源。资源是编译期查表，不存在文件系统访问。
   drogon::app().registerHandler(
       "/",
@@ -552,6 +678,20 @@ void ApiServer::Impl::setup() {
         handle_history(req, std::move(callback));
       },
       {drogon::Get});
+
+  drogon::app().registerHandler(
+      "/v1/sessions",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_sessions_list(req, std::move(callback));
+      },
+      {drogon::Get});
+
+  drogon::app().registerHandlerViaRegex(
+      R"(/v1/sessions/([A-Za-z0-9_\-]+))",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_session_update(req, std::move(callback));
+      },
+      {drogon::Patch, drogon::Delete});
 
   drogon::app().setDefaultHandler(
       [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
@@ -585,24 +725,108 @@ void ApiServer::Impl::pre_routing(const HttpRequestPtr& req, drogon::AdviceCallb
     return;
   }
 
-  // Drogon 会把 header 名统一转小写，这里用小写的键查。
-  const std::string expected = "Bearer " + config.api_token;
-  if (req->getHeader("authorization") == expected) {
+  const auto token = bearer_token(req->getHeader("authorization"));
+  if (!token.has_value()) {
+    callback(error_response(drogon::k401Unauthorized, "unauthorized",
+                            "缺少 Authorization: Bearer <token>"));
+    return;
+  }
+
+  // 静态管理员 Token 不需要查库，直接放行。
+  if (!config.api_token.empty() && token_equals(*token, config.api_token)) {
+    auth::Principal principal;
+    principal.is_admin = true;
+    principal.auth_type = "static";
+    req->attributes()->insert("principal", principal);
     chain();
     return;
   }
 
+#ifdef AIP_WITH_AUTH
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k401Unauthorized, "unauthorized",
+                            "Token 无效（当前构建未启用用户鉴权）"));
+    return;
+  }
+
+  auto chain_ptr = std::make_shared<drogon::AdviceChainCallback>(std::move(chain));
+  auto callback_ptr = std::make_shared<drogon::AdviceCallback>(std::move(callback));
+  const HttpRequestPtr req_ptr = req;
+  const std::string token_value = *token;
+
+  // JWT/API Key 需要查 users/api_keys；放到 db_workers，避免阻塞 IO 线程。
+  const bool queued = db_workers.submit(
+      [this, token_value, req_ptr, chain_ptr, callback_ptr] {
+        std::optional<auth::Principal> principal;
+        std::optional<HttpResponsePtr> auth_error;
+        try {
+          principal = auth_->authenticate_bearer(token_value);
+        }
+        catch (const std::exception& e) {
+          platform::log_error(std::string("鉴权失败（存储）: ") + e.what());
+          auth_error = error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                                      "鉴权服务暂时不可用，请稍后重试");
+        }
+
+        auto* loop = drogon::app().getLoop();
+        if (loop == nullptr) return;
+        loop->queueInLoop([req_ptr, principal, auth_error, chain_ptr, callback_ptr] {
+          if (auth_error.has_value()) {
+            (*callback_ptr)(*auth_error);
+            return;
+          }
+          if (!principal.has_value()) {
+            (*callback_ptr)(error_response(drogon::k401Unauthorized, "unauthorized",
+                                           "Token 无效或已过期"));
+            return;
+          }
+          req_ptr->attributes()->insert("principal", *principal);
+          (*chain_ptr)();
+        });
+      });
+
+  if (!queued) {
+    (*callback_ptr)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                   "鉴权排队已满，请稍后重试"));
+  }
+#else
   callback(error_response(drogon::k401Unauthorized, "unauthorized",
-                          "缺少或错误的 Authorization: Bearer <token>"));
+                          "Token 无效（当前构建未启用用户鉴权）"));
+#endif
+}
+
+auth::Principal ApiServer::Impl::principal_from(const HttpRequestPtr& req) const {
+  const auto& attributes = req->attributes();
+  if (attributes && attributes->find("principal")) {
+    return attributes->get<auth::Principal>("principal");
+  }
+
+  // 未启用鉴权时，本地请求视为管理员；启用鉴权但没写入 principal 时，
+  // 返回未绑定用户的普通身份，ChatService 会拒绝它。
+  auth::Principal principal;
+  principal.is_admin = !config.auth_enabled();
+  principal.auth_type = config.auth_enabled() ? "none" : "local";
+  return principal;
 }
 
 HttpResponsePtr ApiServer::Impl::health_response() {
-  json body{{"status", "ok"},
-            {"sessions", store.session_count()},
+  std::size_t sessions = 0;
+  bool storage_ok = true;
+  try {
+    sessions = store.session_count();
+  } catch (const std::exception& e) {
+    storage_ok = false;
+    platform::log_warn(std::string("健康检查读取会话数失败: ") + e.what());
+  }
+
+  json body{{"status", storage_ok ? "ok" : "degraded"},
+            {"sessions", sessions},
             {"active_streams", gate.active()},
             {"max_streams", max_streams},
             {"model", config.model},
             {"provider", config.provider},
+            {"storage", config.storage},
+            {"storage_ok", storage_ok},
             {"web", config.web_enabled},
             {"http", "drogon"}};
   if (shutting_down.load(std::memory_order_acquire)) {
@@ -699,13 +923,31 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
     stream = body["stream"].get<bool>();
   }
 
+  std::string request_id;
+  if (body.contains("request_id")) {
+    if (!body["request_id"].is_string()) {
+      callback(error_response(drogon::k400BadRequest, "invalid_request",
+                              "request_id 必须是字符串"));
+      return;
+    }
+    request_id = body["request_id"].get<std::string>();
+    if (request_id.empty() || request_id.size() > 128) {
+      callback(error_response(drogon::k400BadRequest, "invalid_request",
+                              "request_id 长度应在 1~128"));
+      return;
+    }
+  }
+
   const std::string model_name = model.empty() ? config.model : model;
+  const auth::Principal principal = principal_from(req);
 
   if (!stream) {
     auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
-    const bool queued =
-        workers.submit([this, session_id, user_text, model, model_name, shared_callback] {
-          handle_non_stream(session_id, user_text, model, model_name, shared_callback);
+    const bool queued = workers.submit(
+        [this, principal, session_id, user_text, model, model_name, request_id,
+         shared_callback] {
+          handle_non_stream(principal, session_id, user_text, model, model_name, request_id,
+                            shared_callback);
         });
     if (!queued) {
       (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
@@ -721,31 +963,212 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
     return;
   }
   auto slot = std::make_shared<StreamSlot>(gate);
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
 
-  chat::ChatService::Turn turn;
-  try {
-    turn = service.start(session_id, user_text, model);
-  } catch (const std::exception& e) {
-    platform::log_error(std::string("启动对话失败: ") + e.what());
-    // slot 随作用域释放，名额不会泄漏。
-    callback(error_response(drogon::k502BadGateway, "upstream_error", "无法连接模型服务"));
-    return;
+  // 会话读写放到独立线程池：Drogon 的 IO 线程只做 epoll/send，不在这里等 PostgreSQL。
+  const bool queued = db_workers.submit(
+      [this, principal, session_id, user_text, model, model_name, request_id, slot,
+       shared_callback] {
+        chat::ChatService::Turn turn;
+        const std::string scope = principal.scope();
+        auto mark_failed = [this, &scope, &request_id](const std::string& type,
+                                                       const std::string& message) {
+          if (request_id.empty() || idempotency_ == nullptr) return;
+          try {
+            idempotency_->fail(scope, request_id, type, message);
+          } catch (const std::exception& e) {
+            platform::log_warn(std::string("写幂等失败状态失败: ") + e.what());
+          }
+        };
+
+        try {
+          if (!request_id.empty() && idempotency_ != nullptr) {
+            const chat::DedupRecord dedup = idempotency_->claim(scope, request_id);
+            if (dedup.status == chat::DedupStatus::InProgress) {
+              post(shared_callback, idempotency_busy_response());
+              return;
+            }
+            if (dedup.status == chat::DedupStatus::Completed) {
+              const auto message = store.message(dedup.assistant_message_id);
+              if (!message.has_value()) {
+                idempotency_->remove(scope, request_id);
+                post(shared_callback, idempotency_conflict_response());
+                return;
+              }
+              auto replay = std::make_shared<chat::ReplayStream>(message->content);
+              auto* replay_loop = drogon::app().getLoop();
+              if (replay_loop == nullptr) return;
+              replay_loop->queueInLoop(
+                  [this, replay, dedup, model_name, slot, shared_callback]() mutable {
+                    auto resp = make_sse_response(replay, util::random_id("chatcmpl-"),
+                                                  model_name, std::move(slot));
+                    resp->addHeader("X-Session-Id", dedup.session_id);
+                    (*shared_callback)(resp);
+                  });
+              return;
+            }
+          }
+
+          long long daily_used = 0;
+          if (usage_ != nullptr) {
+            daily_used = usage_->summary_today(principal.user_id).total_tokens();
+          }
+          quota::QuotaGuard guard;
+          if (quota_ != nullptr) {
+            auto acquired = quota_->try_acquire(
+                principal, estimate_request_tokens(user_text, config.max_tokens), daily_used);
+            if (!acquired.decision.allowed) {
+              mark_failed("rate_limited", acquired.decision.message);
+              post(shared_callback, quota_error(acquired.decision));
+              return;
+            }
+            guard = std::move(acquired.guard);
+          }
+
+          std::shared_ptr<chat::TurnObserver> observer;
+          if (!request_id.empty() && idempotency_ != nullptr) {
+            observer = std::make_shared<chat::IdempotencyObserver>(*idempotency_, scope,
+                                                                  request_id);
+          }
+          turn = service.start(principal, session_id, user_text, model, request_id,
+                               std::move(guard), observer);
+        } catch (const chat::ContextTooLong& e) {
+          mark_failed("context_too_long", e.what());
+          post(shared_callback,
+               error_response(drogon::k413RequestEntityTooLarge, "context_too_long", e.what()));
+          return;
+        } catch (const chat::Forbidden& e) {
+          mark_failed("forbidden", e.what());
+          post(shared_callback,
+               error_response(drogon::k404NotFound, "not_found", e.what()));
+          return;
+        }
+#ifdef AIP_WITH_POSTGRES
+        catch (const storage::DbError& e) {
+          mark_failed("storage_unavailable", e.what());
+          platform::log_error(std::string("启动对话失败（存储）: ") + e.what());
+          post(shared_callback,
+               error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                              "会话存储暂时不可用，请稍后重试"));
+          return;
+        }
+#endif
+        catch (const std::exception& e) {
+          mark_failed("upstream_error", e.what());
+          platform::log_error(std::string("启动对话失败: ") + e.what());
+          post(shared_callback,
+               error_response(drogon::k502BadGateway, "upstream_error", "无法连接模型服务"));
+          return;
+        }
+
+        auto* loop = drogon::app().getLoop();
+        if (loop == nullptr) return;  // 退出中：turn/slot 析构会取消上游并释放名额
+        loop->queueInLoop(
+            [this, turn = std::move(turn), model_name, slot, shared_callback]() mutable {
+              auto resp = make_sse_response(std::move(turn.stream),
+                                            util::random_id("chatcmpl-"), model_name,
+                                            std::move(slot));
+              resp->addHeader("X-Session-Id", turn.session_id);
+              (*shared_callback)(resp);
+            });
+      });
+
+  if (!queued) {
+    slot->release();
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "请求排队已满，请稍后重试"));
   }
-
-  auto resp = make_sse_response(std::move(turn.stream), util::random_id("chatcmpl-"), model_name,
-                                std::move(slot));
-  resp->addHeader("X-Session-Id", turn.session_id);
-  callback(resp);
 }
 
-void ApiServer::Impl::handle_non_stream(const std::string& session_id,
+void ApiServer::Impl::handle_non_stream(const auth::Principal& principal,
+                                        const std::string& session_id,
                                         const std::string& user_text, const std::string& model,
                                         const std::string& model_name,
+                                        const std::string& request_id,
                                         const std::shared_ptr<ResponseCallback>& callback) {
   chat::ChatService::Turn turn;
+  const std::string scope = principal.scope();
+  auto mark_failed = [this, &scope, &request_id](const std::string& type,
+                                                 const std::string& message) {
+    if (request_id.empty() || idempotency_ == nullptr) return;
+    try {
+      idempotency_->fail(scope, request_id, type, message);
+    } catch (const std::exception& e) {
+      platform::log_warn(std::string("写幂等失败状态失败: ") + e.what());
+    }
+  };
+
   try {
-    turn = service.start(session_id, user_text, model);
-  } catch (const std::exception& e) {
+    if (!request_id.empty() && idempotency_ != nullptr) {
+      const chat::DedupRecord dedup = idempotency_->claim(scope, request_id);
+      if (dedup.status == chat::DedupStatus::InProgress) {
+        post(callback, idempotency_busy_response());
+        return;
+      }
+      if (dedup.status == chat::DedupStatus::Completed) {
+        const auto message = store.message(dedup.assistant_message_id);
+        if (!message.has_value()) {
+          idempotency_->remove(scope, request_id);
+          post(callback, idempotency_conflict_response());
+          return;
+        }
+        json out{{"id", util::random_id("chatcmpl-")},
+                 {"object", "chat.completion"},
+                 {"created", now_s()},
+                 {"model", model_name},
+                 {"session_id", dedup.session_id},
+                 {"idempotent_replay", true},
+                 {"choices",
+                  json::array({{{"index", 0},
+                                {"message", {{"role", "assistant"}, {"content", message->content}}},
+                                {"finish_reason", "stop"}}})}};
+        post(callback, json_ok(out));
+        return;
+      }
+    }
+
+    long long daily_used = 0;
+    if (usage_ != nullptr) {
+      daily_used = usage_->summary_today(principal.user_id).total_tokens();
+    }
+    quota::QuotaGuard guard;
+    if (quota_ != nullptr) {
+      auto acquired = quota_->try_acquire(
+          principal, estimate_request_tokens(user_text, config.max_tokens), daily_used);
+      if (!acquired.decision.allowed) {
+        mark_failed("rate_limited", acquired.decision.message);
+        post(callback, quota_error(acquired.decision));
+        return;
+      }
+      guard = std::move(acquired.guard);
+    }
+
+    std::shared_ptr<chat::TurnObserver> observer;
+    if (!request_id.empty() && idempotency_ != nullptr) {
+      observer = std::make_shared<chat::IdempotencyObserver>(*idempotency_, scope, request_id);
+    }
+    turn = service.start(principal, session_id, user_text, model, request_id,
+                         std::move(guard), observer);
+  } catch (const chat::ContextTooLong& e) {
+    mark_failed("context_too_long", e.what());
+    post(callback, error_response(drogon::k413RequestEntityTooLarge, "context_too_long", e.what()));
+    return;
+  } catch (const chat::Forbidden& e) {
+    mark_failed("forbidden", e.what());
+    post(callback, error_response(drogon::k404NotFound, "not_found", e.what()));
+    return;
+  }
+#ifdef AIP_WITH_POSTGRES
+  catch (const storage::DbError& e) {
+    mark_failed("storage_unavailable", e.what());
+    platform::log_error(std::string("启动对话失败（存储）: ") + e.what());
+    post(callback, error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                                  "会话存储暂时不可用，请稍后重试"));
+    return;
+  }
+#endif
+  catch (const std::exception& e) {
+    mark_failed("upstream_error", e.what());
     platform::log_error(std::string("启动对话失败: ") + e.what());
     post(callback, error_response(drogon::k502BadGateway, "upstream_error", "无法连接模型服务"));
     return;
@@ -792,6 +1215,7 @@ void ApiServer::Impl::handle_non_stream(const std::string& session_id,
            {"created", now_s()},
            {"model", model_name},
            {"session_id", turn.session_id},
+           {"idempotent_replay", false},
            {"choices",
             json::array({{{"index", 0},
                           {"message", {{"role", "assistant"}, {"content", answer}}},
@@ -831,14 +1255,615 @@ void ApiServer::Impl::handle_history(const HttpRequestPtr& req, ResponseCallback
     session_id = path.substr(kPrefix.size(), path.size() - kPrefix.size() - kSuffix.size());
   }
 
-  const auto messages = store.history(session_id, 100);
-
-  json list = json::array();
-  for (const auto& message : messages) {
-    list.push_back({{"role", message.role}, {"content", message.content}});
+  std::size_t limit = 100;
+  const std::string limit_text = req->getParameter("limit");
+  if (!limit_text.empty()) {
+    try {
+      const unsigned long parsed = std::stoul(limit_text);
+      if (parsed < 1 || parsed > 100) throw std::out_of_range("limit");
+      limit = static_cast<std::size_t>(parsed);
+    } catch (const std::exception&) {
+      callback(error_response(drogon::k400BadRequest, "invalid_request",
+                              "limit 必须是 1~100 的整数"));
+      return;
+    }
   }
-  callback(json_ok({{"session_id", session_id}, {"messages", list}}));
+
+  const auth::Principal principal = principal_from(req);
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued = db_workers.submit([this, session_id, principal, limit, shared_callback] {
+    try {
+      if (!store.owns(principal.user_id, principal.is_admin, session_id)) {
+        post(shared_callback,
+             error_response(drogon::k404NotFound, "not_found", "会话不存在或无权访问"));
+        return;
+      }
+      const auto messages = store.history(session_id, limit);
+      json list = json::array();
+      for (const auto& message : messages) {
+        list.push_back({{"role", message.role}, {"content", message.content}});
+      }
+      post(shared_callback, json_ok({{"session_id", session_id}, {"messages", list}}));
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("读取会话历史失败（存储）: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                          "会话存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("读取会话历史失败: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k500InternalServerError, "internal_error", "读取会话失败"));
+    }
+  });
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "请求排队已满，请稍后重试"));
+  }
 }
+
+void ApiServer::Impl::handle_sessions_list(const HttpRequestPtr& req,
+                                            ResponseCallback&& callback) {
+  const auth::Principal principal = principal_from(req);
+  if (!principal.is_admin && principal.user_id <= 0) {
+    callback(error_response(drogon::k401Unauthorized, "unauthorized",
+                            "该接口需要用户身份（JWT/API Key）"));
+    return;
+  }
+
+  std::size_t limit = 20;
+  std::size_t offset = 0;
+  const std::string limit_text = req->getParameter("limit");
+  const std::string offset_text = req->getParameter("offset");
+  try {
+    if (!limit_text.empty()) {
+      const unsigned long parsed = std::stoul(limit_text);
+      if (parsed < 1 || parsed > 100) throw std::out_of_range("limit");
+      limit = static_cast<std::size_t>(parsed);
+    }
+    if (!offset_text.empty()) {
+      const unsigned long parsed = std::stoul(offset_text);
+      if (parsed > 100000) throw std::out_of_range("offset");
+      offset = static_cast<std::size_t>(parsed);
+    }
+  } catch (const std::exception&) {
+    callback(error_response(drogon::k400BadRequest, "invalid_request",
+                            "limit 应为 1~100，offset 应为 0~100000"));
+    return;
+  }
+
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued = db_workers.submit([this, principal, limit, offset, shared_callback] {
+    try {
+      auto sessions =
+          store.list(principal.user_id, principal.is_admin, limit + 1, offset);
+      const bool has_more = sessions.size() > limit;
+      if (has_more) sessions.resize(limit);
+      json list = json::array();
+      for (const auto& session : sessions) list.push_back(session_json(session));
+      post(shared_callback, json_ok(json{{"sessions", list}, {"has_more", has_more}}));
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("读取会话列表失败（存储）: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                          "会话存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("读取会话列表失败: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k500InternalServerError, "internal_error", "读取会话列表失败"));
+    }
+  });
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "请求排队已满，请稍后重试"));
+  }
+}
+
+void ApiServer::Impl::handle_session_update(const HttpRequestPtr& req,
+                                             ResponseCallback&& callback) {
+  const auth::Principal principal = principal_from(req);
+  if (!principal.is_admin && principal.user_id <= 0) {
+    callback(error_response(drogon::k401Unauthorized, "unauthorized",
+                            "该接口需要用户身份（JWT/API Key）"));
+    return;
+  }
+
+  static constexpr std::string_view kPrefix = "/v1/sessions/";
+  const std::string& path = req->path();
+  if (path.size() <= kPrefix.size() || path.compare(0, kPrefix.size(), kPrefix) != 0 ||
+      path.find('/', kPrefix.size()) != std::string::npos) {
+    callback(error_response(drogon::k404NotFound, "not_found", "会话不存在"));
+    return;
+  }
+  const std::string session_id = path.substr(kPrefix.size());
+
+  if (req->method() == drogon::Patch) {
+    json body;
+    try {
+      body = json::parse(std::string(req->body()));
+    } catch (const std::exception&) {
+      callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体不是合法 JSON"));
+      return;
+    }
+    if (!body.is_object() || !body.contains("title") || !body["title"].is_string()) {
+      callback(error_response(drogon::k400BadRequest, "invalid_request",
+                              "title 必须是字符串"));
+      return;
+    }
+    const std::string title = body["title"].get<std::string>();
+    if (title.empty() || title.size() > 200 ||
+        title.find_first_not_of(" \t\r\n") == std::string::npos) {
+      callback(error_response(drogon::k400BadRequest, "invalid_request",
+                              "title 长度应在 1~200，且不能全为空白"));
+      return;
+    }
+
+    auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+    const bool queued =
+        db_workers.submit([this, principal, session_id, title, shared_callback] {
+          try {
+            if (!store.rename(principal.user_id, principal.is_admin, session_id, title)) {
+              post(shared_callback,
+                   error_response(drogon::k404NotFound, "not_found", "会话不存在或无权访问"));
+              return;
+            }
+            const auto updated = store.get(session_id);
+            if (!updated.has_value()) {
+              post(shared_callback,
+                   error_response(drogon::k404NotFound, "not_found", "会话不存在"));
+              return;
+            }
+            post(shared_callback, json_ok(json{{"session", session_json(*updated)}}));
+          }
+#ifdef AIP_WITH_POSTGRES
+          catch (const storage::DbError& e) {
+            platform::log_error(std::string("重命名会话失败（存储）: ") + e.what());
+            post(shared_callback,
+                 error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                                "会话存储暂时不可用，请稍后重试"));
+          }
+#endif
+          catch (const std::exception& e) {
+            platform::log_error(std::string("重命名会话失败: ") + e.what());
+            post(shared_callback,
+                 error_response(drogon::k500InternalServerError, "internal_error", "重命名失败"));
+          }
+        });
+    if (!queued) {
+      (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                        "请求排队已满，请稍后重试"));
+    }
+    return;
+  }
+
+  if (req->method() == drogon::Delete) {
+    auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+    const bool queued = db_workers.submit([this, principal, session_id, shared_callback] {
+      try {
+        if (!store.remove(principal.user_id, principal.is_admin, session_id)) {
+          post(shared_callback,
+               error_response(drogon::k404NotFound, "not_found", "会话不存在或无权访问"));
+          return;
+        }
+        post(shared_callback, json_ok(json{{"deleted", true}, {"id", session_id}}));
+      }
+#ifdef AIP_WITH_POSTGRES
+      catch (const storage::DbError& e) {
+        platform::log_error(std::string("删除会话失败（存储）: ") + e.what());
+        post(shared_callback,
+             error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                            "会话存储暂时不可用，请稍后重试"));
+      }
+#endif
+      catch (const std::exception& e) {
+        platform::log_error(std::string("删除会话失败: ") + e.what());
+        post(shared_callback,
+             error_response(drogon::k500InternalServerError, "internal_error", "删除失败"));
+      }
+    });
+    if (!queued) {
+      (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                        "请求排队已满，请稍后重试"));
+    }
+    return;
+  }
+
+  callback(error_response(drogon::k405MethodNotAllowed, "method_not_allowed",
+                          "只支持 PATCH / DELETE"));
+}
+
+#ifdef AIP_WITH_AUTH
+void ApiServer::Impl::post_auth_error(const std::shared_ptr<ResponseCallback>& callback,
+                                      const auth::AuthError& error) {
+  const AuthHttpError info = auth_http_error(error.code());
+  post(callback, error_response(static_cast<drogon::HttpStatusCode>(info.status), info.type,
+                                error.what()));
+}
+
+void ApiServer::Impl::handle_auth_register(const HttpRequestPtr& req,
+                                           ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+
+  json body;
+  try {
+    body = json::parse(std::string(req->body()));
+  } catch (const std::exception&) {
+    callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体不是合法 JSON"));
+    return;
+  }
+  if (!body.is_object() || !body.contains("email") || !body["email"].is_string() ||
+      !body.contains("password") || !body["password"].is_string()) {
+    callback(error_response(drogon::k400BadRequest, "invalid_request",
+                            "email 和 password 必须是字符串"));
+    return;
+  }
+  if (body.contains("display_name") && !body["display_name"].is_string()) {
+    callback(error_response(drogon::k400BadRequest, "invalid_request",
+                            "display_name 必须是字符串"));
+    return;
+  }
+
+  const std::string email = body["email"].get<std::string>();
+  const std::string password = body["password"].get<std::string>();
+  const std::string display_name =
+      body.contains("display_name") ? body["display_name"].get<std::string>() : std::string{};
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+
+  const bool queued = db_workers.submit([this, email, password, display_name, shared_callback] {
+    try {
+      const auth::TokenPair pair = auth_->register_user(email, password, display_name);
+      post(shared_callback, json_ok(token_pair_json(pair)));
+    } catch (const auth::AuthError& e) {
+      post_auth_error(shared_callback, e);
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("注册失败（存储）: ") + e.what());
+      post(shared_callback, error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                                           "用户存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("注册失败: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k500InternalServerError, "internal_error", "注册失败"));
+    }
+  });
+
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "注册排队已满，请稍后重试"));
+  }
+}
+
+void ApiServer::Impl::handle_auth_login(const HttpRequestPtr& req, ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+
+  json body;
+  try {
+    body = json::parse(std::string(req->body()));
+  } catch (const std::exception&) {
+    callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体不是合法 JSON"));
+    return;
+  }
+  if (!body.is_object() || !body.contains("email") || !body["email"].is_string() ||
+      !body.contains("password") || !body["password"].is_string()) {
+    callback(error_response(drogon::k400BadRequest, "invalid_request",
+                            "email 和 password 必须是字符串"));
+    return;
+  }
+
+  const std::string email = body["email"].get<std::string>();
+  const std::string password = body["password"].get<std::string>();
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+
+  const bool queued = db_workers.submit([this, email, password, shared_callback] {
+    try {
+      const auth::TokenPair pair = auth_->login(email, password);
+      post(shared_callback, json_ok(token_pair_json(pair)));
+    } catch (const auth::AuthError& e) {
+      post_auth_error(shared_callback, e);
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("登录失败（存储）: ") + e.what());
+      post(shared_callback, error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                                           "用户存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("登录失败: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k500InternalServerError, "internal_error", "登录失败"));
+    }
+  });
+
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "登录排队已满，请稍后重试"));
+  }
+}
+
+void ApiServer::Impl::handle_auth_refresh(const HttpRequestPtr& req,
+                                          ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+
+  std::string refresh_token;
+  const auto header_token = bearer_token(req->getHeader("authorization"));
+  if (header_token.has_value()) {
+    refresh_token = *header_token;
+  } else {
+    json body;
+    try {
+      body = json::parse(std::string(req->body()));
+    } catch (const std::exception&) {
+      callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体不是合法 JSON"));
+      return;
+    }
+    if (!body.is_object() || !body.contains("refresh_token") ||
+        !body["refresh_token"].is_string()) {
+      callback(error_response(drogon::k400BadRequest, "invalid_request",
+                              "缺少 Authorization: Bearer <refresh_token> 或 refresh_token 字段"));
+      return;
+    }
+    refresh_token = body["refresh_token"].get<std::string>();
+  }
+
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued = db_workers.submit([this, refresh_token, shared_callback] {
+    try {
+      const auth::TokenPair pair = auth_->refresh(refresh_token);
+      post(shared_callback, json_ok(token_pair_json(pair)));
+    } catch (const auth::AuthError& e) {
+      post_auth_error(shared_callback, e);
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("刷新 token 失败（存储）: ") + e.what());
+      post(shared_callback, error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                                           "用户存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("刷新 token 失败: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k500InternalServerError, "internal_error", "刷新 token 失败"));
+    }
+  });
+
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "刷新排队已满，请稍后重试"));
+  }
+}
+
+void ApiServer::Impl::handle_auth_me(const HttpRequestPtr& req, ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+  const auth::Principal principal = principal_from(req);
+  if (principal.user_id <= 0) {
+    callback(error_response(drogon::k401Unauthorized, "unauthorized",
+                            "静态管理员 Token 没有用户资料，请使用 JWT/API Key"));
+    return;
+  }
+
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued = db_workers.submit([this, principal, shared_callback] {
+    try {
+      auto user = auth_->get_user(principal.user_id);
+      if (!user.has_value()) {
+        post(shared_callback,
+             error_response(drogon::k404NotFound, "not_found", "用户不存在"));
+        return;
+      }
+      post(shared_callback, json_ok(json{{"user", user_json(*user)}}));
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("读取用户失败（存储）: ") + e.what());
+      post(shared_callback, error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                                           "用户存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("读取用户失败: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k500InternalServerError, "internal_error", "读取用户失败"));
+    }
+  });
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "请求排队已满，请稍后重试"));
+  }
+}
+
+void ApiServer::Impl::handle_auth_list_api_keys(const HttpRequestPtr& req,
+                                                ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+  const auth::Principal principal = principal_from(req);
+  if (principal.user_id <= 0) {
+    callback(error_response(drogon::k401Unauthorized, "unauthorized",
+                            "该接口需要用户身份（JWT/API Key）"));
+    return;
+  }
+
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued = db_workers.submit([this, principal, shared_callback] {
+    try {
+      json list = json::array();
+      for (const auto& key : auth_->list_api_keys(principal)) list.push_back(api_key_json(key));
+      post(shared_callback, json_ok({{"api_keys", list}}));
+    } catch (const auth::AuthError& e) {
+      post_auth_error(shared_callback, e);
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("读取 API Key 失败（存储）: ") + e.what());
+      post(shared_callback, error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                                           "用户存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("读取 API Key 失败: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k500InternalServerError, "internal_error", "读取 API Key 失败"));
+    }
+  });
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "请求排队已满，请稍后重试"));
+  }
+}
+
+void ApiServer::Impl::handle_auth_create_api_key(const HttpRequestPtr& req,
+                                                 ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+  const auth::Principal principal = principal_from(req);
+  if (principal.user_id <= 0) {
+    callback(error_response(drogon::k401Unauthorized, "unauthorized",
+                            "该接口需要用户身份（JWT/API Key）"));
+    return;
+  }
+
+  std::string name;
+  if (!req->body().empty()) {
+    json body;
+    try {
+      body = json::parse(std::string(req->body()));
+    } catch (const std::exception&) {
+      callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体不是合法 JSON"));
+      return;
+    }
+    if (!body.is_object() || (body.contains("name") && !body["name"].is_string())) {
+      callback(error_response(drogon::k400BadRequest, "invalid_request", "name 必须是字符串"));
+      return;
+    }
+    if (body.contains("name")) name = body["name"].get<std::string>();
+  }
+
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued = db_workers.submit([this, principal, name, shared_callback] {
+    try {
+      const auth::IssuedApiKey issued = auth_->create_api_key(principal, name);
+      json out = api_key_json(issued.info);
+      out["key"] = issued.plaintext;
+      auto resp = json_ok(out);
+      resp->setStatusCode(drogon::k201Created);
+      post(shared_callback, std::move(resp));
+    } catch (const auth::AuthError& e) {
+      post_auth_error(shared_callback, e);
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("创建 API Key 失败（存储）: ") + e.what());
+      post(shared_callback, error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                                           "用户存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("创建 API Key 失败: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k500InternalServerError, "internal_error", "创建 API Key 失败"));
+    }
+  });
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "请求排队已满，请稍后重试"));
+  }
+}
+
+void ApiServer::Impl::handle_auth_delete_api_key(const HttpRequestPtr& req,
+                                                 ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+  const auth::Principal principal = principal_from(req);
+  if (principal.user_id <= 0) {
+    callback(error_response(drogon::k401Unauthorized, "unauthorized",
+                            "该接口需要用户身份（JWT/API Key）"));
+    return;
+  }
+
+  static constexpr std::string_view kPrefix = "/v1/auth/api-keys/";
+  const std::string& path = req->path();
+  if (path.size() <= kPrefix.size() || path.compare(0, kPrefix.size(), kPrefix) != 0) {
+    callback(error_response(drogon::k400BadRequest, "invalid_request", "API Key ID 不合法"));
+    return;
+  }
+  std::int64_t key_id = 0;
+  try {
+    key_id = std::stoll(path.substr(kPrefix.size()));
+  } catch (const std::exception&) {
+    key_id = 0;
+  }
+  if (key_id <= 0) {
+    callback(error_response(drogon::k400BadRequest, "invalid_request", "API Key ID 不合法"));
+    return;
+  }
+
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued = db_workers.submit([this, principal, key_id, shared_callback] {
+    try {
+      if (!auth_->revoke_api_key(principal, key_id)) {
+        post(shared_callback,
+             error_response(drogon::k404NotFound, "not_found", "API Key 不存在"));
+        return;
+      }
+      post(shared_callback, json_ok({{"revoked", true}, {"id", key_id}}));
+    } catch (const auth::AuthError& e) {
+      post_auth_error(shared_callback, e);
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("撤销 API Key 失败（存储）: ") + e.what());
+      post(shared_callback, error_response(drogon::k503ServiceUnavailable, "storage_unavailable",
+                                           "用户存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("撤销 API Key 失败: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k500InternalServerError, "internal_error", "撤销 API Key 失败"));
+    }
+  });
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "请求排队已满，请稍后重试"));
+  }
+}
+#endif
 
 void ApiServer::Impl::post(const std::shared_ptr<ResponseCallback>& callback,
                            HttpResponsePtr resp) {
@@ -861,6 +1886,7 @@ bool ApiServer::Impl::run() {
   // 走到这里 event loop 已经停了：在途泵的 send 会失败并 cancel，然后 join 掉。
   pumps.drain();
   workers.stop();
+  db_workers.stop();
   return true;
 }
 
@@ -891,8 +1917,10 @@ void ApiServer::Impl::begin_shutdown() {
 }
 
 ApiServer::ApiServer(const platform::Config& config, chat::ChatService& service,
-                     chat::SessionStore& store)
-    : impl_(std::make_unique<Impl>(config, service, store)) {}
+                     chat::SessionStore& store, auth::AuthService* auth,
+                     quota::QuotaService* quota, usage::UsageSink* usage,
+                     chat::IdempotencyStore* idempotency)
+    : impl_(std::make_unique<Impl>(config, service, store, auth, quota, usage, idempotency)) {}
 
 ApiServer::~ApiServer() = default;
 
@@ -902,9 +1930,9 @@ bool ApiServer::run() {
                      std::to_string(impl_->io_threads()) + "  max_streams=" +
                      std::to_string(impl_->max_streams));
   if (impl_->config.auth_enabled()) {
-    platform::log_info("已启用 Bearer Token 鉴权（AIP_TOKEN）");
+    platform::log_info("鉴权已启用（静态 Token / JWT / API Key）");
   } else {
-    platform::log_warn("未设置 AIP_TOKEN：接口无鉴权，请勿直接暴露到公网");
+    platform::log_warn("未启用鉴权（AIP_TOKEN/AIP_JWT_SECRET/AIP_AUTH_REQUIRED 均为空），请勿暴露到公网");
   }
   return impl_->run();
 }

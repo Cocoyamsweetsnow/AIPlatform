@@ -9,16 +9,22 @@
 #include <cstddef>
 #include <memory>
 
+#include "auth/auth_service.h"
 #include "chat/chat_service.h"
+#include "chat/idempotency.h"
 #include "chat/session_store.h"
 #include "config.h"
+#include "quota/quota.h"
+#include "usage/usage.h"
 
 namespace http {
 
 class ApiServer {
  public:
   ApiServer(const platform::Config& config, chat::ChatService& service,
-            chat::SessionStore& store);
+            chat::SessionStore& store, auth::AuthService* auth = nullptr,
+            quota::QuotaService* quota = nullptr, usage::UsageSink* usage = nullptr,
+            chat::IdempotencyStore* idempotency = nullptr);
   ~ApiServer();
 
   ApiServer(const ApiServer&) = delete;

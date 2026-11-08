@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "chat/chat_service.h"
@@ -11,6 +12,19 @@
 #include "http/server.h"
 #include "llm/mock_provider.h"
 #include "llm/openai_provider.h"
+#include "quota/quota.h"
+
+#include "auth/auth_service.h"
+#if defined(AIP_WITH_AUTH) && defined(AIP_WITH_POSTGRES)
+#include "auth/pg_user_store.h"
+#endif
+#ifdef AIP_WITH_POSTGRES
+#include "chat/pg_idempotency_store.h"
+#include "chat/pg_session_store.h"
+#include "storage/db.h"
+#include "storage/migrations.h"
+#include "usage/pg_usage_sink.h"
+#endif
 
 namespace {
 
@@ -52,19 +66,79 @@ int main() {
       log_info("model gateway: mock（离线模式，不消耗 token）");
     }
 
-    chat::SessionStore store(/*max_messages_per_session=*/200, /*max_sessions=*/
-                             static_cast<std::size_t>(config.max_sessions));
+    std::unique_ptr<chat::SessionStore> store;
+    auth::AuthService* auth_ptr = nullptr;
+    usage::UsageSink* usage_ptr = nullptr;
+    std::unique_ptr<chat::IdempotencyStore> idempotency;
+#ifdef AIP_WITH_POSTGRES
+    std::unique_ptr<storage::DbPool> db;
+    std::unique_ptr<usage::PgUsageSink> usage_sink;
+#ifdef AIP_WITH_AUTH
+    std::unique_ptr<auth::PgUserStore> user_store;
+    std::unique_ptr<auth::AuthService> auth_service;
+#endif
+#endif
+    if (config.postgres_enabled()) {
+#ifdef AIP_WITH_POSTGRES
+      storage::DbConfig db_config;
+      db_config.dsn = config.db_dsn;
+      db_config.pool_size = config.db_pool_size;
+      db_config.connect_timeout_s = config.db_connect_timeout_s;
+      db = std::make_unique<storage::DbPool>(db_config);
+      storage::run_migrations(*db);
+      store = std::make_unique<chat::PgSessionStore>(*db);
+      idempotency = std::make_unique<chat::PgIdempotencyStore>(*db,
+                                                               config.idempotency_ttl_s);
+      usage_sink = std::make_unique<usage::PgUsageSink>(*db);
+      usage_ptr = usage_sink.get();
+      log_info("storage: postgres（会话/消息持久化，进程重启不丢）");
+#ifdef AIP_WITH_AUTH
+      user_store = std::make_unique<auth::PgUserStore>(*db);
+      auth::AuthConfig auth_config;
+      auth_config.static_token = config.api_token;
+      auth_config.jwt.secret = config.jwt_secret;
+      auth_config.jwt.issuer = config.jwt_issuer;
+      auth_config.jwt.access_ttl_s = config.jwt_ttl_s;
+      auth_config.jwt.refresh_ttl_s = config.jwt_refresh_ttl_s;
+      auth_service = std::make_unique<auth::AuthService>(*user_store, std::move(auth_config));
+      auth_ptr = auth_service.get();
+      if (config.auth_enabled()) {
+        log_info("auth: 用户鉴权已启用（静态 Token / JWT / API Key）");
+      } else {
+        log_warn("auth: 用户接口已启用，但未配置 AIP_TOKEN/AIP_JWT_SECRET/AIP_AUTH_REQUIRED，"
+                 "对话接口仍匿名开放");
+      }
+#endif
+#else
+      throw std::runtime_error(
+          "当前构建未启用 PostgreSQL（-DAIPLATFORM_WITH_POSTGRES=OFF）");
+#endif
+    } else {
+      store = std::make_unique<chat::MemorySessionStore>(
+          /*max_messages_per_session=*/200,
+          static_cast<std::size_t>(config.max_sessions));
+      idempotency = std::make_unique<chat::MemoryIdempotencyStore>();
+      log_info("storage: memory（重启即丢，仅适合演示/测试）");
+    }
 
     chat::ChatOptions chat_options;
     chat_options.system_prompt = config.system_prompt;
     chat_options.max_history_messages = static_cast<std::size_t>(config.max_history_messages);
     chat_options.max_tokens = config.max_tokens;
+    chat_options.max_context_tokens = config.max_context_tokens;
     chat_options.temperature = config.temperature;
     chat_options.default_model = config.model;
 
-    chat::ChatService service(*provider, store, std::move(chat_options));
+    chat::ChatService service(*provider, *store, std::move(chat_options), usage_ptr);
 
-    http::ApiServer server(config, service, store);
+    quota::QuotaConfig quota_config;
+    quota_config.rpm_limit = config.rpm_limit;
+    quota_config.daily_token_limit = config.daily_token_limit;
+    quota_config.max_concurrent = config.max_concurrent_per_user;
+    quota::QuotaService quota_service(quota_config);
+
+    http::ApiServer server(config, service, *store, auth_ptr, &quota_service, usage_ptr,
+                      idempotency.get());
     std::signal(SIGPIPE, SIG_IGN);  // 客户端断开时不要被 SIGPIPE 干掉
 
     log_info("try: curl -N http://127.0.0.1:" + std::to_string(config.port) +

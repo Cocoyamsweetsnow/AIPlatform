@@ -30,7 +30,27 @@ struct Config {
   // 对话
   std::string system_prompt{"你是一个乐于助人的 AI 助手，回答简洁准确。"};
   int max_history_messages{20};
+  int max_context_tokens{8192};
   int max_sessions{10000};
+
+  // 持久化（阶段 3）
+  std::string storage{"memory"};  // memory | postgres
+  std::string db_dsn;             // AIP_DB_DSN，storage=postgres 时必填
+  int db_pool_size{8};            // 1~64
+  int db_connect_timeout_s{5};    // 1~60
+
+  // 用户鉴权（阶段 4）
+  bool auth_required{false};          // AIP_AUTH_REQUIRED；强制所有非公开接口鉴权
+  std::string jwt_secret;             // AIP_JWT_SECRET；生产必须显式设置且多副本一致
+  std::string jwt_issuer{"aiplatform"};
+  int jwt_ttl_s{900};                 // access token 15 分钟
+  int jwt_refresh_ttl_s{7 * 24 * 3600};
+
+  // 配额（阶段 4；0 = 不限）
+  int rpm_limit{60};                  // 每用户每分钟请求数
+  int daily_token_limit{1000000};     // 每用户每日 token
+  int max_concurrent_per_user{4};     // 每用户并发流
+  int idempotency_ttl_s{180};         // in_progress 超过该时间视为崩溃，可重试
 
   // HTTP 层（Drogon 后端；httplib 回退实现只用 heartbeat_s）
   int io_threads{0};         // 0 = 按核数自动（2~8）
@@ -40,7 +60,10 @@ struct Config {
 
   static Config from_env();
 
-  bool auth_enabled() const { return !api_token.empty(); }
+  bool auth_enabled() const {
+    return auth_required || !api_token.empty() || !jwt_secret.empty();
+  }
+  bool postgres_enabled() const { return storage == "postgres"; }
 };
 
 }  // namespace platform

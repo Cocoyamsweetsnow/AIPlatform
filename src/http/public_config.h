@@ -20,6 +20,7 @@ inline std::string public_config_json(const platform::Config& config, const char
       {"http", http_backend},
       {"provider", config.provider},
       {"model", config.model},
+      {"storage", config.storage},
       {"auth_required", config.auth_enabled()},
       {"web", config.web_enabled},
       {"max_message_bytes", 32 * 1024},

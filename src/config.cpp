@@ -91,7 +91,24 @@ Config Config::from_env() {
 
   c.system_prompt = env_str("AIP_SYSTEM_PROMPT", c.system_prompt);
   c.max_history_messages = env_int("AIP_MAX_HISTORY", c.max_history_messages);
+  c.max_context_tokens = env_int("AIP_MAX_CONTEXT_TOKENS", c.max_context_tokens);
   c.max_sessions = env_int("AIP_MAX_SESSIONS", c.max_sessions);
+
+  c.storage = env_str("AIP_STORAGE", c.storage);
+  c.db_dsn = env_str("AIP_DB_DSN", c.db_dsn);
+  c.db_pool_size = env_int("AIP_DB_POOL_SIZE", c.db_pool_size);
+  c.db_connect_timeout_s = env_int("AIP_DB_CONNECT_TIMEOUT_S", c.db_connect_timeout_s);
+
+  c.auth_required = env_bool("AIP_AUTH_REQUIRED", c.auth_required);
+  c.jwt_secret = env_str("AIP_JWT_SECRET", c.jwt_secret);
+  c.jwt_issuer = env_str("AIP_JWT_ISSUER", c.jwt_issuer);
+  c.jwt_ttl_s = env_int("AIP_JWT_TTL_S", c.jwt_ttl_s);
+  c.jwt_refresh_ttl_s = env_int("AIP_JWT_REFRESH_TTL_S", c.jwt_refresh_ttl_s);
+  c.rpm_limit = env_int("AIP_RPM_LIMIT", c.rpm_limit);
+  c.daily_token_limit = env_int("AIP_DAILY_TOKEN_LIMIT", c.daily_token_limit);
+  c.max_concurrent_per_user =
+      env_int("AIP_MAX_CONCURRENT_PER_USER", c.max_concurrent_per_user);
+  c.idempotency_ttl_s = env_int("AIP_IDEMPOTENCY_TTL_S", c.idempotency_ttl_s);
 
   c.io_threads = env_int("AIP_IO_THREADS", c.io_threads);
   c.max_streams = env_int("AIP_MAX_STREAMS", c.max_streams);
@@ -103,6 +120,12 @@ Config Config::from_env() {
 
   if (c.port <= 0 || c.port > 65535) throw std::runtime_error("AIP_PORT 超出范围");
   if (c.max_tokens <= 0) throw std::runtime_error("AIP_MAX_TOKENS 必须为正数");
+  if (c.max_context_tokens < 1024 || c.max_context_tokens > 1000000) {
+    throw std::runtime_error("AIP_MAX_CONTEXT_TOKENS 应在 [1024, 1000000]");
+  }
+  if (c.max_tokens >= c.max_context_tokens) {
+    throw std::runtime_error("AIP_MAX_TOKENS 必须小于 AIP_MAX_CONTEXT_TOKENS");
+  }
   if (c.temperature < 0.0 || c.temperature > 2.0) {
     throw std::runtime_error("AIP_TEMPERATURE 应在 [0, 2] 区间");
   }
@@ -123,6 +146,66 @@ Config Config::from_env() {
   if (c.shutdown_drain_s < 0 || c.shutdown_drain_s > 600) {
     throw std::runtime_error("AIP_SHUTDOWN_DRAIN_S 应在 [0, 600] 秒");
   }
+  if (c.storage != "memory" && c.storage != "postgres") {
+    throw std::runtime_error("AIP_STORAGE 只支持 memory 或 postgres，当前值: " + c.storage);
+  }
+  if (c.storage == "postgres") {
+#if !defined(AIP_WITH_POSTGRES)
+    throw std::runtime_error(
+        "当前构建未启用 PostgreSQL 支持（-DAIPLATFORM_WITH_POSTGRES=OFF），"
+        "请用 AIP_STORAGE=memory 或重新编译");
+#else
+    if (c.db_dsn.empty()) {
+      throw std::runtime_error(
+          "AIP_STORAGE=postgres 时必须设置 AIP_DB_DSN，"
+          "例如 postgresql://aiplatform:aiplatform@127.0.0.1:55432/aiplatform");
+    }
+#endif
+  }
+  if (c.db_pool_size < 1 || c.db_pool_size > 64) {
+    throw std::runtime_error("AIP_DB_POOL_SIZE 应在 [1, 64]");
+  }
+  if (c.db_connect_timeout_s < 1 || c.db_connect_timeout_s > 60) {
+    throw std::runtime_error("AIP_DB_CONNECT_TIMEOUT_S 应在 [1, 60] 秒");
+  }
+  if (c.jwt_issuer.empty() || c.jwt_issuer.size() > 64) {
+    throw std::runtime_error("AIP_JWT_ISSUER 长度应在 1~64");
+  }
+  if (c.jwt_ttl_s < 60 || c.jwt_ttl_s > 86400) {
+    throw std::runtime_error("AIP_JWT_TTL_S 应在 [60, 86400] 秒");
+  }
+  if (c.jwt_refresh_ttl_s < 3600 || c.jwt_refresh_ttl_s > 2592000) {
+    throw std::runtime_error("AIP_JWT_REFRESH_TTL_S 应在 [3600, 2592000] 秒");
+  }
+  if (!c.jwt_secret.empty() && c.jwt_secret.size() < 32) {
+    throw std::runtime_error("AIP_JWT_SECRET 至少 32 个字节（建议 openssl rand -hex 32）");
+  }
+  if (c.rpm_limit < 0 || c.rpm_limit > 1000000) {
+    throw std::runtime_error("AIP_RPM_LIMIT 应在 [0, 1000000]（0 表示不限）");
+  }
+  if (c.daily_token_limit < 0 || c.daily_token_limit > 1000000000) {
+    throw std::runtime_error("AIP_DAILY_TOKEN_LIMIT 应在 [0, 1000000000]（0 表示不限）");
+  }
+  if (c.max_concurrent_per_user < 0 || c.max_concurrent_per_user > 1000) {
+    throw std::runtime_error("AIP_MAX_CONCURRENT_PER_USER 应在 [0, 1000]（0 表示不限）");
+  }
+  if (c.idempotency_ttl_s < 30 || c.idempotency_ttl_s > 3600) {
+    throw std::runtime_error("AIP_IDEMPOTENCY_TTL_S 应在 [30, 3600] 秒");
+  }
+  if (c.auth_required && c.api_token.empty() && c.jwt_secret.empty()) {
+    throw std::runtime_error(
+        "AIP_AUTH_REQUIRED=1 时必须配置 AIP_TOKEN 或 AIP_JWT_SECRET");
+  }
+  if (!c.jwt_secret.empty() && c.storage != "postgres") {
+    throw std::runtime_error("JWT/用户体系需要 AIP_STORAGE=postgres（用户存在 PostgreSQL）");
+  }
+#if !defined(AIP_WITH_AUTH)
+  if (!c.jwt_secret.empty() || c.auth_required) {
+    throw std::runtime_error(
+        "当前构建未启用用户鉴权（-DAIPLATFORM_WITH_AUTH=OFF），"
+        "请改用 AIP_TOKEN 或重新编译");
+  }
+#endif
   if (c.provider != "mock" && c.provider != "openai") {
     throw std::runtime_error("AIP_PROVIDER 只支持 mock 或 openai，当前值: " + c.provider);
   }
