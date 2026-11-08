@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
-"""测试用的假上游：模拟 OpenAI 兼容的 SSE 接口，用于验证 C++ 侧网关逻辑。"""
+"""测试用的假上游：模拟 OpenAI 兼容的 SSE 接口，用于验证 C++ 侧网关逻辑。
+
+环境变量：
+  FAKE_FAIL_FIRST=N   前 N 个请求直接返回错误（默认 0），用于验证重试
+  FAKE_FAIL_STATUS=S  错误状态码（默认 429）
+"""
 import json
+import os
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+FAIL_FIRST = int(os.getenv("FAKE_FAIL_FIRST", "0"))
+FAIL_STATUS = int(os.getenv("FAKE_FAIL_STATUS", "429"))
+_requests = 0
+_requests_lock = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -13,8 +26,25 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[upstream] " + fmt % args + "\n")
 
     def do_POST(self):
+        global _requests
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
+
+        with _requests_lock:
+            index = _requests
+            _requests += 1
+
+        if index < FAIL_FIRST:
+            payload = json.dumps(
+                {"error": {"message": "simulated failure", "type": "rate_limit"}}
+            ).encode()
+            self.send_response(FAIL_STATUS)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            self.wfile.flush()
+            return
 
         if self.headers.get("Authorization") != "Bearer good-key":
             payload = json.dumps({"error": {"message": "Invalid API key", "type": "auth"}}).encode()
