@@ -1,6 +1,24 @@
 # 本地一键起：docker compose --env-file .env up --build
 # .env 从 config/config.example.env 复制，至少设置 AIP_API_KEY 才能用真实模型。
 services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aiplatform
+      POSTGRES_USER: aiplatform
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aiplatform}
+    # 映射到 55432，避免和宿主机已有的 5432 冲突
+    ports:
+      - "55432:5432"
+    volumes:
+      - aiplatform_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiplatform -d aiplatform"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   api:
     build: .
     image: aiplatform:dev
@@ -10,6 +28,19 @@ services:
     environment:
       AIP_HOST: 0.0.0.0
       AIP_PORT: "8080"
+      # compose 里默认走 PostgreSQL；本地裸跑默认仍是 memory
+      AIP_STORAGE: postgres
+      AIP_DB_DSN: "host=postgres port=5432 dbname=aiplatform user=aiplatform password=${POSTGRES_PASSWORD:-aiplatform} connect_timeout=5"
+      AIP_DB_POOL_SIZE: "8"
+      # 生产请在 .env 设置 AIP_JWT_SECRET（>=32 字节）和 AIP_AUTH_REQUIRED=1；
+      # 未设置时用户接口仍可用，但对话接口在未配置 AIP_TOKEN 时是匿名开放的。
+      AIP_AUTH_REQUIRED: "${AIP_AUTH_REQUIRED:-false}"
+      AIP_RPM_LIMIT: "${AIP_RPM_LIMIT:-60}"
+      AIP_DAILY_TOKEN_LIMIT: "${AIP_DAILY_TOKEN_LIMIT:-1000000}"
+      AIP_MAX_CONCURRENT_PER_USER: "${AIP_MAX_CONCURRENT_PER_USER:-4}"
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8080:8080"
     healthcheck:
@@ -23,3 +54,6 @@ services:
         limits:
           cpus: "2"
           memory: 512M
+
+volumes:
+  aiplatform_pgdata:

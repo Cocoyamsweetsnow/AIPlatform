@@ -21,7 +21,7 @@ ARG BUILD_JOBS=2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake pkg-config ca-certificates \
-      libcurl4-openssl-dev \
+      libcurl4-openssl-dev libpq-dev libargon2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- 2. Drogon 工具链（很慢，单独成层，只有主线需要）---------------------
@@ -75,7 +75,7 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAIPLATFORM_HTTP=drogon \
 FROM debian:bookworm-slim AS runtime-httplib
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libcurl4 ca-certificates curl \
+      libcurl4 libpq5 libargon2-1 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home app
 
@@ -91,7 +91,7 @@ ENTRYPOINT ["/usr/local/bin/aiplatform"]
 FROM debian:bookworm-slim AS runtime-drogon
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libcurl4 libjsoncpp25 libuuid1 libssl3 zlib1g \
+      libcurl4 libpq5 libargon2-1 libjsoncpp25 libuuid1 libssl3 zlib1g \
       libc-ares2 libbrotli1 \
       ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
