@@ -7,11 +7,25 @@ on:
   workflow_dispatch:
 
 jobs:
-  # 快速门禁：httplib 回退后端编译 + 单元测试，约 1 分钟。
+  # 快速门禁：httplib 回退后端编译 + 单元测试 + PostgreSQL 集成测试，约 1~2 分钟。
   # 目的是「任何一次提交都有人管」，Drogon 那条慢链路放在下面单独跑。
   unit-httplib:
-    name: 单元测试（httplib 回退后端）
+    name: 单元 + PG 集成（httplib 回退后端）
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aiplatform
+          POSTGRES_PASSWORD: aiplatform
+          POSTGRES_DB: aiplatform_test
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U aiplatform -d aiplatform_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
 
@@ -19,7 +33,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config libcurl4-openssl-dev
+            build-essential cmake pkg-config libcurl4-openssl-dev libpq-dev libargon2-dev
 
       - name: 配置（httplib 后端）
         run: cmake -S . -B build -DAIPLATFORM_HTTP=httplib -DAIPLATFORM_BUILD_TESTS=ON
@@ -27,7 +41,9 @@ jobs:
       - name: 编译
         run: cmake --build build -j"$(nproc)"
 
-      - name: 单元测试
+      - name: 单元测试 + PostgreSQL 集成测试
+        env:
+          AIP_TEST_PG_DSN: postgresql://aiplatform:aiplatform@127.0.0.1:5432/aiplatform_test
         run: ctest --test-dir build --output-on-failure
 
   # 主线门禁：真正跑 Drogon 实现。
