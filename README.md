@@ -5,8 +5,11 @@
 
 这个仓库解决的是「从 0 到第一个能跑通、能演示、能接真实模型」的那一段，
 所有代码都围绕一个目标：**让流式对话链路先正确地跑起来**。
+阶段 3 的 PostgreSQL 持久化、阶段 4 的用户鉴权（JWT/API Key）与配额/用量已经落地，
+见 [adr/0002](docs/adr/0002-postgresql-persistence.md)、[adr/0003](docs/adr/0003-auth.md)、
+[adr/0004](docs/adr/0004-quota-usage.md)。
 
-## 已实现（阶段 0~2 + 内置演示前端）
+## 已实现（阶段 0~2 + 持久化 + 用户鉴权 + 内置演示前端）
 
 - ✅ HTTP 服务（**Drogon**，连接不占线程）：`/healthz`、`/v1/config`、`/v1/chat/completions`、`/v1/sessions/{id}/messages`
 - ✅ 内置 Web UI（零构建单页，编译进二进制）：流式对话、Markdown / 代码块、会话本地持久化、明暗主题、Token 设置
@@ -16,8 +19,17 @@
 - ✅ 上游失败重试（仅首 token 前；408/409/425/429/5xx + 连接类错误，指数退避 + 抖动）
 - ✅ 多 API Key 轮转（`AIP_API_KEYS`，重试自动换 key）
 - ✅ 客户端断开 → 取消上游请求（不浪费 token）
-- ✅ 多轮上下文（内存会话存储，带 LRU 淘汰）
-- ✅ Bearer Token 鉴权、CORS、请求日志、统一错误码
+- ✅ 多轮上下文（内存 LRU 或 PostgreSQL 会话存储）
+- ✅ **PostgreSQL 持久化（M1）**：`AIP_STORAGE=postgres` 时会话/消息落库，重启不丢；
+  迁移自动执行、连接池、软删除、按用户隔离的会话归属
+- ✅ 鉴权：静态 `AIP_TOKEN`（admin）/ JWT（HS256，access 15m + refresh 7d）/ API Key（SHA-256 哈希、可撤销）
+- ✅ 多租户会话归属：普通用户只能访问自己的会话；admin 可访问全部
+- ✅ 配额限流：每用户 RPM / 并发流 / 每日 token；超出返回 429 + `Retry-After`
+- ✅ 用量流水：`usage_records` 记录 prompt/completion tokens、TTFT、latency
+- ✅ 请求幂等：`request_id` 重放非流式/流式结果，`in_progress` 409，崩溃 TTL 自动恢复
+- ✅ 会话管理：列表/改名/软删除；历史支持 `limit`，跨用户 404
+- ✅ token 预算上下文：按估算 token 裁剪 system + 历史 + user，超预算 413 `context_too_long`
+- ✅ CORS、请求日志、统一错误码
 - ✅ 流数量准入（超出 `AIP_MAX_STREAMS` 直接 503）、SSE 心跳
 - ✅ 优雅退出（SIGTERM → 停止接新请求 → 等在途流收尾 → 退出）
 - ✅ 单元测试、Docker 多阶段构建、CI（含 Drogon 镜像冒烟）
@@ -44,6 +56,15 @@ ctest --test-dir build --output-on-failure
 ./build/aiplatform
 ```
 
+需要持久化时（会话/消息落 PostgreSQL，重启不丢）：
+
+```bash
+docker compose up -d postgres          # 只起数据库，映射到 55432
+AIP_STORAGE=postgres \
+AIP_DB_DSN='postgresql://aiplatform:aiplatform@127.0.0.1:55432/aiplatform?connect_timeout=5' \
+./build/aiplatform
+```
+
 另开一个终端：
 
 ```bash
@@ -63,6 +84,65 @@ data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"delta":
 
 data: [DONE]
 ```
+
+### 用户鉴权（可选，需要 PostgreSQL）
+
+```bash
+# 生产必须显式设置 >=32 字节；多副本要一致
+export AIP_JWT_SECRET="$(openssl rand -hex 32)"
+AIP_STORAGE=postgres \
+AIP_DB_DSN='postgresql://aiplatform:aiplatform@127.0.0.1:55432/aiplatform?connect_timeout=5' \
+./build/aiplatform
+```
+
+```bash
+# 注册：返回 access_token / refresh_token；密码 8~128 字节
+curl -sS http://127.0.0.1:8080/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"alice@example.com","password":"password123","display_name":"Alice"}'
+
+# 带 JWT 对话
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"你好"}'
+
+# 创建 API Key（明文只返回一次）
+curl -sS http://127.0.0.1:8080/v1/auth/api-keys \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"name":"cli"}'
+```
+
+- `AIP_AUTH_REQUIRED=1` 强制鉴权；`AIP_TOKEN` 仍可作为**管理员**静态 Token。
+- 未设置 `AIP_TOKEN` / `AIP_JWT_SECRET` / `AIP_AUTH_REQUIRED` 时是本地匿名管理员模式，
+  只适合内网/演示。
+- JWT 需要 `AIP_STORAGE=postgres`（用户存 PostgreSQL）；memory 模式只支持静态 Token。
+
+### 配额与用量
+
+```bash
+export AIP_RPM_LIMIT=60                    # 每用户每分钟请求数，0 = 不限
+export AIP_DAILY_TOKEN_LIMIT=1000000       # 每用户每日 token，0 = 不限
+export AIP_MAX_CONCURRENT_PER_USER=4       # 每用户并发流，0 = 不限
+```
+
+- 超限返回 `429`，带 `Retry-After` 秒数；每日配额用 `type=quota_exceeded`。
+- 每次完成/取消的请求写 `usage_records`：`user_id/session_id/model/prompt_tokens/
+  completion_tokens/latency_ms/ttft_ms`。
+- 当前限流是**进程内**的，单实例精确；多副本部署前必须切 Redis 或网关限流。
+- 静态管理员和未绑定用户的请求不受限；普通 JWT/API Key 用户按上面的配置限流。
+
+### 上下文预算
+
+```bash
+export AIP_MAX_CONTEXT_TOKENS=8192   # 模型上下文总预算
+export AIP_MAX_TOKENS=1024           # 其中给 completion 预留
+```
+
+`ChatService` 按 `system + 最近历史 + 本轮 user` 估算 token，装不下就裁掉更早的历史；
+system + user 都放不下时直接返回 `413 context_too_long`，不调用上游。
+估算不是 tokenizer，长中文/代码会有偏差；`AIP_MAX_TOKENS` 必须小于
+`AIP_MAX_CONTEXT_TOKENS`。
 
 接真实模型（任何 OpenAI 兼容接口）：
 
@@ -108,12 +188,41 @@ AIP_WEB=false ./build/aiplatform
 {
   "app": "AIPlatform", "version": "0.1.0", "api": "openai-compatible",
   "http": "drogon", "provider": "mock", "model": "deepseek-chat",
-  "auth_required": false, "web": true,
+  "storage": "memory", "auth_required": false, "web": true,
   "max_message_bytes": 32768, "max_streams": 512
 }
 ```
 
 ## API
+
+### 鉴权接口
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| POST | `/v1/auth/register` | 公开 | 邮箱 + 密码注册，返回 JWT 对与用户信息 |
+| POST | `/v1/auth/login` | 公开 | 登录，返回 JWT 对 |
+| POST | `/v1/auth/refresh` | 公开（需 refresh token） | 用 refresh token 换新 access/refresh |
+| GET | `/v1/auth/me` | 用户 | 当前用户资料；静态管理员返回 401 |
+| GET | `/v1/auth/api-keys` | 用户 | 当前用户的 API Key 列表（不含明文/哈希） |
+| POST | `/v1/auth/api-keys` | 用户 | 创建 API Key，`key` 明文只返回一次 |
+| DELETE | `/v1/auth/api-keys/{id}` | 用户 | 撤销 API Key |
+
+```jsonc
+// POST /v1/auth/register
+{ "email": "alice@example.com", "password": "password123", "display_name": "Alice" }
+
+// 200
+{
+  "token_type": "Bearer",
+  "access_token": "eyJ...",
+  "refresh_token": "eyJ...",
+  "expires_in": 900,
+  "user": { "id": 1, "email": "alice@example.com", "display_name": "Alice", "role": "user" }
+}
+```
+
+鉴权头统一为 `Authorization: Bearer <JWT | API Key | AIP_TOKEN>`。
+普通用户的会话互相隔离；跨用户访问历史返回 404（避免枚举）。
 
 ### `POST /v1/chat/completions`
 
@@ -122,7 +231,8 @@ AIP_WEB=false ./build/aiplatform
   "message": "你好",           // 必填；也兼容 OpenAI 的 messages 数组（取最后一条 user）
   "session_id": "s_xxx",       // 可选；为空则新建会话，ID 通过响应头 X-Session-Id 返回
   "model": "deepseek-chat",    // 可选
-  "stream": true               // 默认 true
+  "stream": true,              // 默认 true
+  "request_id": "req_xxx"      // 可选；同 scope 内唯一，重复请求重放原结果
 }
 ```
 
@@ -133,6 +243,17 @@ AIP_WEB=false ./build/aiplatform
   在途流达到 `AIP_MAX_STREAMS` 时直接返回 503（`too_many_streams`），不会排队。
 - `stream: false` → 一个 `chat.completion` JSON，含 `usage`（在 WorkerPool 里跑，不占 IO 线程）。
 
+### 会话管理
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/v1/sessions?limit=20&offset=0` | 当前用户会话列表，返回 `has_more` |
+| PATCH | `/v1/sessions/{id}` | `{ "title": "新标题" }` |
+| DELETE | `/v1/sessions/{id}` | 软删除 |
+| GET | `/v1/sessions/{id}/messages?limit=100` | 最近 N 条原始消息 |
+
+普通用户只能访问自己的会话；跨用户/不存在都返回 404。静态 `AIP_TOKEN` 可访问全部。
+
 ### `GET /v1/sessions/{id}/messages`
 
 返回该会话最近 100 条消息。
@@ -142,9 +263,12 @@ AIP_WEB=false ./build/aiplatform
 ```jsonc
 // 正常
 {"status":"ok","sessions":3,"active_streams":0,"max_streams":512,
- "model":"deepseek-chat","provider":"mock","web":true,"http":"drogon"}
+ "model":"deepseek-chat","provider":"mock","storage":"postgres","storage_ok":true,
+ "web":true,"http":"drogon"}
 // 正在退出（仍返回 200，避免 liveness 探针误杀；LB 应看 draining 摘流量）
 {"status":"draining","draining":true,...}
+// 存储不可用（仍返回 200，storage_ok=false；后续会加 readiness）
+{"status":"degraded","storage":"postgres","storage_ok":false,...}
 ```
 
 ### `GET /v1/config`
@@ -156,7 +280,8 @@ AIP_WEB=false ./build/aiplatform
 ### 内置静态资源
 
 `GET /`、`/index.html`、`/assets/*`、`/favicon.svg` 由二进制内的资源表直接返回，
-不读文件系统。启用 `AIP_TOKEN` 时这些路径仍然公开（否则页面本身打不开），
+不读文件系统。启用鉴权（`AIP_TOKEN`/`AIP_JWT_SECRET`/`AIP_AUTH_REQUIRED`）时这些路径仍然公开
+（否则页面本身打不开），
 `/v1/chat/completions` 和会话历史接口照常鉴权；`AIP_WEB=false` 时不再暴露。
 
 ### 错误格式
@@ -168,9 +293,14 @@ AIP_WEB=false ./build/aiplatform
 | HTTP | type | 场景 |
 |---|---|---|
 | 400 | `invalid_request` / `invalid_json` | 参数缺失、JSON 非法 |
-| 401 | `unauthorized` | 缺少或错误的 Bearer Token |
-| 413 | `payload_too_large` | 单条消息超过 32KB |
+| 401 | `unauthorized` / `invalid_credentials` | 缺少/错误 Bearer Token、登录失败 |
+| 403 | `account_disabled` | 账号被禁用 |
+| 409 | `email_exists` | 重复注册 |
+| 409 | `request_in_progress` / `idempotency_conflict` | 同 request_id 正在执行/重放不可用 |
+| 429 | `rate_limited` / `quota_exceeded` | RPM/并发超限、每日 token 配额用尽 |
+| 413 | `payload_too_large` / `context_too_long` | 单条消息超过 32KB、上下文超预算 |
 | 502 | `upstream_error` | 上游模型报错 |
+| 503 | `storage_unavailable` / `auth_unavailable` / `server_busy` | 数据库/鉴权不可用、队列满 |
 | 504 | `timeout` | 上游超时 |
 
 ### 上游重试与多 Key
@@ -187,6 +317,12 @@ AIP_WEB=false ./build/aiplatform
 ```bash
 ./scripts/demo.sh                    # 冒烟测试（健康检查 / 流式 / 多轮 / 历史 / 错误码）
 ./scripts/test_retry.sh              # 验证首 token 前重试（前 2 次 429，第 3 次成功）
+./scripts/test_pg.sh                 # 临时 PostgreSQL + pg 集成测试（迁移/CRUD/归属/软删除）
+./scripts/test_persistence.sh        # 杀进程重启，验证会话历史仍在
+./scripts/test_auth.sh              # 注册/登录/JWT/API Key/跨用户隔离/撤销/刷新
+./scripts/test_quota.sh             # RPM 429/Retry-After/每日配额/usage 流水
+./scripts/test_idempotency.sh        # 非流式/流式重放、in_progress 409、failed 重试
+./scripts/test_sessions.sh           # 列表/改名/软删除/跨用户/history limit
 python3 scripts/fake_upstream.py &   # 假上游，验证 OpenAI 协议与错误路径
 ```
 
@@ -211,13 +347,43 @@ src/
 │   ├── threaded_stream.h     后台线程 + 队列模板
 │   ├── openai_provider.cpp   OpenAI 兼容 + SSE 解析 + 取消
 │   └── mock_provider.cpp     离线假模型
+├── auth/                     用户鉴权
+│   ├── principal.h           请求身份（user_id / admin / auth_type）
+│   ├── types.h               User / ApiKeyInfo / TokenPair
+│   ├── password_hasher.*     Argon2id
+│   ├── jwt.*                 HS256 JWT（access/refresh）
+│   ├── api_key.*             API Key 生成/哈希/常量时间比较
+│   ├── auth_service.*        注册/登录/刷新/Bearer 解析/API Key 管理
+│   ├── user_store.h          用户存储接口
+│   ├── pg_user_store.*       PostgreSQL 实现
+│   └── errors.h              AuthError（400/401/403/409）
+├── storage/                  PostgreSQL 基础设施
+│   ├── db.{h,cpp}            连接池 / Lease / Transaction / Result
+│   └── migrations.{h,cpp}    版本化迁移 + advisory lock
+├── quota/                    进程内配额（RPM / 并发 / 每日 token）
+│   └── quota.{h,cpp}         QuotaService + RAII QuotaGuard
+├── usage/                    用量流水
+│   ├── usage.h               UsageSink 接口
+│   └── pg_usage_sink.*       PostgreSQL 实现 + 当天汇总
 ├── chat/                     业务层（上下文、会话存储）
+│   ├── session_store.{h,cpp} SessionStore 接口 + 内存 LRU 实现
+│   ├── pg_session_store.*    PostgreSQL 实现
+│   ├── chat_service.{h,cpp}  拼上下文 / 调 Provider / 落库装饰器
+│   ├── token_estimate.*      token 估算
+│   ├── context_builder.*     token 预算上下文裁剪
+│   ├── idempotency.*         幂等存储接口 + 内存实现 + TurnObserver
+│   ├── pg_idempotency_store.* PostgreSQL request_dedup 实现
+│   ├── replay_stream.h       幂等重放流
+│   └── errors.h              Forbidden / SessionNotFound
 └── http/                     HTTP 层（两个后端，API 契约一致）
     ├── server.h              对外接口（PIMPL，不暴露框架类型）
     ├── public_config.h       /v1/config 的公开字段
     ├── server_drogon.cpp     主线：Drogon + 泵线程 + 准入 + drain + 内置 UI
     └── server_httplib.cpp    回退：cpp-httplib（-DAIPLATFORM_HTTP=httplib）
 ```
+
+`third_party/libpq/` 是随仓库分发的 PostgreSQL 客户端头文件；运行时只需要 `libpq5`。
+
 
 ## 设计要点
 
@@ -241,8 +407,17 @@ Drogon 用 reactor，**连接本身不占线程**：实测 300 路挂起连接�
 
 ## 下一步
 
-路线图里列了从阶段 3 到阶段 7 的详细步骤：PostgreSQL 持久化 → 多租户与配额 →
-可观测性与压测 → 上线 → RAG / 工具调用 / 本地推理。
+P0 生产化按 M1~M5 拆分，现已全部落地：M1 持久化、M2 用户/JWT/API Key/归属、
+M3 配额限流/usage 流水、M4 请求幂等/会话管理、M5 token 预算上下文。见
+[adr/0002](docs/adr/0002-postgresql-persistence.md)、[adr/0003](docs/adr/0003-auth.md)、
+[adr/0004](docs/adr/0004-quota-usage.md)、[adr/0005](docs/adr/0005-idempotency-sessions.md)、
+[adr/0006](docs/adr/0006-context-budget.md)。
+
+下一阶段是 roadmap 的阶段 6/7：可观测性（metrics/结构化日志）、正式压测、部署、
+RAG/工具调用/本地推理。
+
+更完整的长期路线（可观测性、压测、RAG / 工具调用 / 本地推理）见
+[docs/ROADMAP.md](docs/ROADMAP.md)。
 
 内置单页已经覆盖「演示 + 联调」；生产前端是否复用 Open WebUI / 自研 Next.js，
 仍按 [docs/DECISIONS.md](docs/DECISIONS.md) 的 D6 由人拍板。
@@ -253,16 +428,26 @@ Drogon 用 reactor，**连接本身不占线程**：实测 300 路挂起连接�
 |---|---|
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 从零到上线的 8 个阶段、架构、DDL、踩坑清单 |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | 架构选型决策清单（待拍板表格） |
+| [docs/adr/0001-http-framework.md](docs/adr/0001-http-framework.md) | 为什么迁移到 Drogon |
+| [docs/adr/0002-postgresql-persistence.md](docs/adr/0002-postgresql-persistence.md) | 持久化选型、schema、迁移与验收记录 |
+| [docs/adr/0003-auth.md](docs/adr/0003-auth.md) | JWT / API Key / Argon2id 鉴权设计 |
+| [docs/adr/0004-quota-usage.md](docs/adr/0004-quota-usage.md) | 配额/限流/用量流水设计 |
+| [docs/adr/0005-idempotency-sessions.md](docs/adr/0005-idempotency-sessions.md) | 请求幂等与会话管理 API |
+| [docs/adr/0006-context-budget.md](docs/adr/0006-context-budget.md) | token 预算上下文裁剪 |
 | [docs/BUILD.md](docs/BUILD.md) | 编译、运行、镜像构建、排错手册 |
 | [docs/GIT.md](docs/GIT.md) | Git 工作流、提交规范、发布与事故处理 |
 
 ## 说明
 
-- `third_party/` 里是两个单头文件库（cpp-httplib 0.18.3、nlohmann/json 3.11.3），
-  直接随仓库分发，避免依赖管理工具带来的首次构建开销。
+- `third_party/` 里有 cpp-httplib 0.18.3、nlohmann/json 3.11.3 两个单头文件库，
+  以及 `libpq/`、`argon2/` 的客户端头文件；直接随仓库分发，避免依赖管理工具带来的首次构建开销。
   `third_party/nlohmann/json.hpp` 是个转发头，让 `#include <nlohmann/json.hpp>` 命中仓库内版本
   （此前能编过是因为构建机恰好装了系统包，换机器就挂）。
-- 会话存储目前是**进程内内存**，重启即丢——这是有意的阶段划分，不是 bug。
+- 用户/JWT/API Key 需要 `AIP_STORAGE=postgres`；memory 模式只保留静态 `AIP_TOKEN`。
+- 会话存储**默认是进程内内存**，重启即丢；设置 `AIP_STORAGE=postgres` 后会话/消息落
+  PostgreSQL，重启不丢。内存模式仍保留给演示、单测和没有数据库的交付环境。
+- PostgreSQL 客户端头文件随仓库分发（`third_party/libpq/`），运行时只需要 `libpq5`；
+  不想引入 PostgreSQL 可用 `-DAIPLATFORM_WITH_POSTGRES=OFF` 构建纯内存版本。
 - Web UI 没有 `package.json` / `node_modules`：`web/` 由 CMake 在构建期转成 C++
   raw string（见 [cmake/embed_web.cmake](cmake/embed_web.cmake)），改完前端重新编译即可。
   页面 CSP 只允许同源脚本；模型输出按不可信文本处理（先转义再渲染，链接只放行

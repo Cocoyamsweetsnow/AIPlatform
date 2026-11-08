@@ -12,8 +12,14 @@
 ```bash
 sudo apt update
 sudo apt install -y build-essential cmake pkg-config libcurl4-openssl-dev \
-                    libjsoncpp-dev uuid-dev zlib1g-dev libssl-dev
+                    libpq5 libargon2-1 libjsoncpp-dev uuid-dev zlib1g-dev libssl-dev
 ```
+
+> PostgreSQL 客户端头文件已经随仓库分发在 `third_party/libpq/include`，
+> 这里只装运行库 `libpq5` 即可；不需要 `libpq-dev`，也不需要 root 权限去装开发包。
+> 完全不想引入 PostgreSQL 时用 `-DAIPLATFORM_WITH_POSTGRES=OFF` 构建纯内存版本；
+> 不想引入用户鉴权时用 `-DAIPLATFORM_WITH_AUTH=OFF`（只保留静态 `AIP_TOKEN`）。
+> Argon2 头文件同样随仓库分发在 `third_party/argon2/include`，运行时只需 `libargon2-1`。
 
 #### 装 Drogon（主线，**≥ 1.9.14**）
 
@@ -62,7 +68,7 @@ cmake -S . -B build \
 
 cmake --build build -j2
 
-# 单元测试（9 项，约 0.4 秒）
+# 单元测试（约 1 秒）；pg_tests 没设置 AIP_TEST_PG_DSN 时会自动 skip
 ctest --test-dir build --output-on-failure
 ```
 
@@ -72,6 +78,12 @@ ctest --test-dir build --output-on-failure
 |---|---|
 | `build/aiplatform` | 服务端二进制（**内置 Web UI**） |
 | `build/unit_tests` | 单元测试（开了 `-DAIPLATFORM_BUILD_TESTS=ON` 才有） |
+| `build/pg_tests` | PostgreSQL 集成测试（需要 `AIP_TEST_PG_DSN`，否则 skip） |
+| `build/auth_tests` | 鉴权原语与 AuthService 单测（不需要数据库） |
+| `build/usage_tests` | 用量记录与 token 估算单测 |
+| `build/quota_tests` | 配额/并发/每日 token 单测 |
+| `build/idempotency_tests` | 幂等状态机/重放流/TurnObserver 单测 |
+| `build/context_tests` | token 预算上下文裁剪单测 |
 | `build/generated/web_assets.cpp` | 由 `web/` 自动生成的嵌入资源，不用手改 |
 
 前端不需要 npm / node：`cmake --build` 时会执行
@@ -88,6 +100,9 @@ C++ raw string 编进二进制。改完 `web/` 重新 `cmake --build build -j2` 
 | `'newAsyncStreamResponse' is not a member of 'drogon::HttpResponse'` | Drogon 版本太低（< 1.9.14），重装 |
 | `error: 'std::span' ...` | 编译器太老，`g++ --version` 需 ≥ 11 |
 | `undefined reference to curl_easy_init` | 链接顺序/静态库问题，重跑一次 `cmake -S . -B build` |
+| `找不到 libpq` / `libpq.so.5: cannot open shared object` | 装 `libpq5`；或 `-DAIPLATFORM_WITH_POSTGRES=OFF` 构建纯内存版本 |
+| 启动时报 `连接 PostgreSQL 失败` | 检查 `AIP_DB_DSN`、数据库是否已起；compose 里是 `postgres:5432`，宿主机是 `127.0.0.1:55432` |
+| `找不到 libargon2` / `libargon2.so.1: cannot open shared object` | 装 `libargon2-1`；或 `-DAIPLATFORM_WITH_AUTH=OFF` 只用静态 Token |
 | 运行时 `error while loading shared libraries: libdrogon.so` | 装完 Drogon 没执行 `sudo ldconfig` |
 
 ---
@@ -110,7 +125,98 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
   -d '{"message":"你好"}'
 ```
 
-### 2.2 接真实模型
+### 2.2 PostgreSQL 持久化模式
+
+```bash
+# 1) 起一个本地 PostgreSQL（compose 里映射到 55432，避免和系统 5432 冲突）
+docker compose up -d postgres
+
+# 2) 用持久化模式启动
+AIP_STORAGE=postgres \
+AIP_DB_DSN='postgresql://aiplatform:aiplatform@127.0.0.1:55432/aiplatform?connect_timeout=5' \
+./build/aiplatform
+```
+
+启动日志应出现 `storage: postgres` 和 `应用数据库迁移 v1`。迁移会自动建表
+（`users / api_keys / sessions / messages / usage_records / request_dedup`）；
+迁移可重复执行，多实例并发启动用 advisory lock 串行化。
+
+验证持久化：
+
+```bash
+./scripts/test_pg.sh             # 临时 PG 容器 + pg_tests（迁移/CRUD/归属/软删除）
+./scripts/test_persistence.sh    # 杀进程重启，确认历史仍在
+```
+
+> `AIP_STORAGE=memory` 仍是默认值；没有数据库时演示和单测不受影响。
+> 连接池大小用 `AIP_DB_POOL_SIZE`（默认 8），连接超时用 `AIP_DB_CONNECT_TIMEOUT_S`。
+
+### 2.3 用户鉴权（JWT / API Key）
+
+```bash
+export AIP_JWT_SECRET="$(openssl rand -hex 32)"   # >=32 字节，多副本必须一致
+AIP_STORAGE=postgres \
+AIP_DB_DSN='postgresql://aiplatform:aiplatform@127.0.0.1:55432/aiplatform?connect_timeout=5' \
+AIP_AUTH_REQUIRED=1 \
+./build/aiplatform
+
+# 注册
+curl -sS http://127.0.0.1:8080/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"alice@example.com","password":"password123"}'
+
+# 带 JWT 对话（TOKEN 替换成返回的 access_token）
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"message":"你好"}'
+```
+
+- `AIP_TOKEN` 仍然有效，视为管理员（可访问所有会话，但不能创建用户 API Key）。
+- `AIP_AUTH_REQUIRED=1` 时，`/healthz`、`/v1/config`、内置页面、`/v1/auth/register|login|refresh` 仍公开。
+- 用户/JWT 需要 PostgreSQL；memory 模式只支持静态 `AIP_TOKEN`。
+- 自动化验收：`./scripts/test_auth.sh`（临时 PG + 注册/登录/JWT/API Key/跨用户/撤销/刷新）。
+
+### 2.4 配额与用量
+
+```bash
+AIP_RPM_LIMIT=60 AIP_DAILY_TOKEN_LIMIT=1000000 AIP_MAX_CONCURRENT_PER_USER=4 \
+AIP_STORAGE=postgres ... ./build/aiplatform
+```
+
+- 超限返回 429 + `Retry-After`；每日配额用 `type=quota_exceeded`。
+- `usage_records` 记录 prompt/completion tokens、latency、TTFT；当前限流是进程内的，
+  多副本需要 Redis/网关限流。
+- 自动化验收：`./scripts/test_quota.sh`（RPM 429、Retry-After、每日配额、usage 落库）。
+
+### 2.5 幂等与会话管理
+
+```bash
+# 同一个 request_id 第二次请求会重放第一次的结果
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"message":"你好","stream":false,"request_id":"demo-1"}'
+
+# 列表 / 改名 / 软删除
+curl -sS -H "Authorization: Bearer $TOKEN" 'http://127.0.0.1:8080/v1/sessions?limit=20'
+curl -sS -X PATCH -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"新标题"}' http://127.0.0.1:8080/v1/sessions/<id>
+curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/sessions/<id>
+```
+
+- 幂等的 `in_progress` 超过 `AIP_IDEMPOTENCY_TTL_S`（默认 180s）会被视为崩溃并允许重试。
+- 自动化验收：`./scripts/test_idempotency.sh`、`./scripts/test_sessions.sh`。
+
+### 2.6 上下文预算
+
+```bash
+AIP_MAX_CONTEXT_TOKENS=8192 AIP_MAX_TOKENS=1024 ./build/aiplatform
+```
+
+- 按估算 token 裁剪 system + 历史 + user；超出返回 413 `context_too_long`。
+- `AIP_MAX_TOKENS` 必须小于 `AIP_MAX_CONTEXT_TOKENS`；估算不是 tokenizer。
+- 单测：`./build/context_tests`。
+
+### 2.7 接真实模型
 
 ```bash
 export AIP_PROVIDER=openai
@@ -134,7 +240,7 @@ export AIP_MODEL=deepseek-chat
 
 全部配置项见 [../config/config.example.env](../config/config.example.env)。
 
-### 2.3 冒烟测试（一次性验证全链路）
+### 2.8 冒烟测试（一次性验证全链路）
 
 ```bash
 ./scripts/demo.sh http://127.0.0.1:8080
@@ -148,7 +254,7 @@ export AIP_MODEL=deepseek-chat
 ./scripts/test_retry.sh
 ```
 
-### 2.4 并发冒烟（秒级，不是正式压测）
+### 2.9 并发冒烟（秒级，不是正式压测）
 
 ```bash
 # 200 路真实 SSE（服务在容器里时，--pid 用容器内的 1）
@@ -160,7 +266,7 @@ python3 scripts/sse_load.py -n 200 \
 判据：`失败 = 0`；线程数峰值 ≈ 2×N（每路流仍是泵线程 + 上游读线程）。
 正式的 k6 / wrk 长时压测请由人执行。
 
-### 2.5 验证优雅退出（drain）
+### 2.10 验证优雅退出（drain）
 
 ```bash
 ./build/aiplatform &          # 另开一个终端跑 200 路冒烟
@@ -193,10 +299,14 @@ cp config/config.example.env .env
 docker run --rm -p 8080:8080 --env-file .env aiplatform:dev
 # 浏览器打开 http://127.0.0.1:8080/ —— Web UI 已随二进制嵌入镜像，无需额外静态目录
 
-# 或者用 compose
+# 或者用 compose（会同时起 postgres，API 默认 AIP_STORAGE=postgres）
 docker compose --env-file .env up -d --build
 docker compose logs -f api
+docker compose logs -f postgres
 ```
+
+> 单容器 `docker run` 默认还是内存模式；要持久化就用 compose，或者给
+> `docker run` 加 `-e AIP_STORAGE=postgres -e AIP_DB_DSN=...` 并自己提供 PostgreSQL。
 
 > 两个 target 的区别：`--target runtime-httplib` 不会被 Drogon 那层拖住，
 > 适合装不上 Drogon 的交付环境。

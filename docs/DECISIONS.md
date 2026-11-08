@@ -51,6 +51,11 @@
 
 **推荐 A。** 如果你们已有 MySQL 运维团队，选 B 也完全合理——只是 RAG 阶段要额外规划向量库。
 
+> **2026-11-08 更新**：M1 已按推荐 A 落地**会话/消息持久化**（`AIP_STORAGE=postgres`），
+> schema 同时建好 users / api_keys / usage_records / request_dedup，为 M2~M4 留位。
+> 选型、迁移和验收记录见 [adr/0002-postgresql-persistence.md](adr/0002-postgresql-persistence.md)。
+> 多租户、配额、用量结算仍未完成，D2 的最终拍板可以等 M2/M3 压测后再确认。
+
 ### D3. 数据访问层
 
 | 选项 | 说明 |
@@ -67,6 +72,10 @@
 | **B. Redis** | 跨进程精确限流、会话热数据、Pub/Sub | 多一个要运维的组件 |
 
 **推荐：单机 A；一旦上多副本，D4 必须切 B**（否则配额会被放大 N 倍）。
+
+> **2026-11-08 更新**：M3 已按单机 A 落地进程内令牌桶（RPM/并发）+ `usage_records`
+> 日汇总；每日 token 配额是“先查后写”，多副本仍会放大/超卖。上多副本前切 Redis
+> 或网关限流，详见 [adr/0004-quota-usage.md](adr/0004-quota-usage.md)。
 
 ### D5. 部署形态
 
@@ -116,6 +125,10 @@ Provider 接口已经为 B/C 留好位置：写一个 `llama_provider.cpp` 即�
 | **A. 自建 JWT + Argon2id** | 对外产品，2~3 天 |
 | B. Keycloak / OIDC | 企业客户、需要 SSO/多因素 |
 | **C. 静态 API Key（现状）** | 内部工具，半小时 |
+
+> **2026-11-08 更新**：M2 已按推荐 A → C 落地：Argon2id + HS256 JWT
+> （access 15m + refresh 7d）+ 可撤销 API Key；静态 `AIP_TOKEN` 保留为管理员。
+> OIDC（B）留给企业 SSO。详见 [adr/0003-auth.md](adr/0003-auth.md)。
 
 ### D9. 依赖管理
 

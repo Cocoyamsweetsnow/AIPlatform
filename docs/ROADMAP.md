@@ -287,6 +287,12 @@ resource_releaser 里 `stream->cancel()`。
 
 ### 阶段 3：持久化（1 周）
 
+> **2026-11-08 更新（M1 已落地）**：`SessionStore` 已抽象为接口，新增
+> `PgSessionStore`（PostgreSQL）+ `storage::DbPool` / 版本化迁移；会话、消息、
+> 会话归属字段已持久化，进程重启不丢。schema 同时建好 users / api_keys /
+> usage_records / request_dedup，但用户、配额、用量、幂等的**业务逻辑**在 M2~M4。
+> 详见 [adr/0002-postgresql-persistence.md](adr/0002-postgresql-persistence.md)。
+
 内存存储重启即丢，必须在「能演示」之后立刻补上。
 
 **3.1 建表（PostgreSQL 16）**
@@ -359,6 +365,14 @@ CREATE INDEX idx_usage_user_time ON usage_records(user_id, created_at DESC);
 ---
 
 ### 阶段 4：账号、多租户、配额（1~1.5 周）
+
+> **2026-11-08 更新（M2/M3/M4 已落地）**：用户注册/登录、JWT（access 15m + refresh 7d）、
+> API Key（SHA-256 哈希、可撤销）、Argon2id 密码哈希、会话按用户隔离已完成；
+> 配额（RPM/并发/每日 token）、429 + Retry-After、usage 流水已完成；
+> `request_id` 幂等、会话列表/改名/软删除、history limit、token 预算上下文也已完成。
+> **未做**：多副本 Redis 限流、严格配额原子扣减、计费金额/报表、OIDC/SSO、
+> 邮箱验证、找回密码。详见 [adr/0003](adr/0003-auth.md)、[adr/0004](adr/0004-quota-usage.md)、
+> [adr/0005](adr/0005-idempotency-sessions.md)、[adr/0006](adr/0006-context-budget.md)。
 
 **4.1 认证**
 
