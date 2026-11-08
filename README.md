@@ -54,6 +54,10 @@ ctest --test-dir build --output-on-failure
 
 # 离线模式（mock 模型，不需要 API key），默认监听 :8080
 ./build/aiplatform
+
+# 想用 .env 里的真实模型 + PostgreSQL（自动拉起 compose 里的 postgres）：
+#   ./scripts/run.sh
+# 只想要内存模式：./scripts/run.sh --memory
 ```
 
 需要持久化时（会话/消息落 PostgreSQL，重启不丢）：

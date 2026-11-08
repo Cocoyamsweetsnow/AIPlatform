@@ -109,6 +109,18 @@ C++ raw string 编进二进制。改完 `web/` 重新 `cmake --build build -j2` 
 
 ## 2. 运行
 
+### 2.0 一键启动（推荐）
+
+```bash
+./scripts/run.sh              # 加载 .env，自动拉起 PostgreSQL，真实模型 + 持久化
+./scripts/run.sh --memory     # 不连数据库，会话重启即丢
+./scripts/run.sh --port 8081  # 换端口
+```
+
+脚本只做三件事：加载 `.env`、确保 compose 里的 PostgreSQL 就绪、`exec ./build/aiplatform`。
+它不会停止数据库、不会删数据卷；`Ctrl-C` 停止应用。8080 被占用时会提示原因和处理方式。
+需要手动控制每一项配置时，再按 2.1~2.7 的原始命令运行。
+
 ### 2.1 离线模式（mock 模型，不需要 API Key）
 
 ```bash
