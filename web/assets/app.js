@@ -12,7 +12,8 @@
   var STORAGE = {
     sessions: "aiplatform.sessions.v1",
     prefs: "aiplatform.prefs.v1",
-    current: "aiplatform.current.v1"
+    current: "aiplatform.current.v1",
+    auth: "aiplatform.auth.v1"
   };
   var MAX_SESSIONS = 40;
   var MAX_MESSAGES = 120;
@@ -39,6 +40,9 @@
     healthChecked: false,
     healthLoading: false,
     prefs: { token: "", theme: "dark" },
+    auth: null,
+    authBusy: false,
+    scopeVersion: 0,
     streaming: false,
     streamingMessageId: null,
     abortController: null,
@@ -162,6 +166,117 @@
     } catch (err) {
       return false;
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 账号状态 / 本地存储作用域                                           */
+  /* ------------------------------------------------------------------ */
+
+  function normalizeUser(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    var id = Number(raw.id);
+    if (!id || id <= 0) return null;
+    return {
+      id: id,
+      email: typeof raw.email === "string" ? raw.email : "",
+      display_name: typeof raw.display_name === "string" ? raw.display_name : "",
+      role: typeof raw.role === "string" ? raw.role : "user"
+    };
+  }
+
+  function normalizeAuth(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    var access = typeof raw.accessToken === "string" ? raw.accessToken : "";
+    var refresh = typeof raw.refreshToken === "string" ? raw.refreshToken : "";
+    var user = normalizeUser(raw.user);
+    if (!access || !user) return null;
+    return { accessToken: access, refreshToken: refresh, user: user };
+  }
+
+  function loadAuth() {
+    return normalizeAuth(readJSON(STORAGE.auth, null));
+  }
+
+  function persistAuth() {
+    if (!storageOk) return;
+    try {
+      if (!state.auth) {
+        window.localStorage.removeItem(STORAGE.auth);
+        return;
+      }
+      window.localStorage.setItem(STORAGE.auth, JSON.stringify(state.auth));
+    } catch (err) {
+      /* 隐私模式 / 存储满：本次登录仍可用，只是刷新后需要重新登录 */
+    }
+  }
+
+  function authUser() {
+    return state.auth && state.auth.user ? state.auth.user : null;
+  }
+
+  // 本地会话按账号隔离：登录前是 .anon，登录后是 .u<user_id>。
+  // 这样同一浏览器切换账号时不会看到上一个账号的本地缓存。
+  function sessionScope() {
+    var user = authUser();
+    return user ? "u" + String(user.id) : "anon";
+  }
+
+  function scopedStorageKey(base) {
+    return base + "." + sessionScope();
+  }
+
+  function migrateLegacyStorage() {
+    if (!storageOk) return;
+    // 旧版本的 key 没有账号前缀，统一迁到匿名作用域；无论当前是否登录都执行，
+    // 这样退出登录后仍能找回升级前的本地会话。
+    try {
+      var sessionsKey = STORAGE.sessions + ".anon";
+      if (!window.localStorage.getItem(sessionsKey)) {
+        var legacySessions = window.localStorage.getItem(STORAGE.sessions);
+        if (legacySessions) window.localStorage.setItem(sessionsKey, legacySessions);
+      }
+      var currentKey = STORAGE.current + ".anon";
+      if (!window.localStorage.getItem(currentKey)) {
+        var legacyCurrent = window.localStorage.getItem(STORAGE.current);
+        if (legacyCurrent) window.localStorage.setItem(currentKey, legacyCurrent);
+      }
+    } catch (err) {
+      /* 迁移失败不影响新会话；老 key 保留不动 */
+    }
+  }
+
+  function applyTokenPair(pair) {
+    if (!pair || typeof pair.access_token !== "string" || !pair.access_token) return false;
+    var user = normalizeUser(pair.user) || authUser();
+    if (!user) return false;
+    state.auth = {
+      accessToken: pair.access_token,
+      refreshToken: typeof pair.refresh_token === "string" ? pair.refresh_token : "",
+      user: user
+    };
+    persistAuth();
+    updateAuthUI();
+    return true;
+  }
+
+  function clearAuth() {
+    state.auth = null;
+    persistAuth();
+    updateAuthUI();
+  }
+
+  function userAuthAvailable() {
+    var auth = state.config && state.config.auth;
+    return Boolean(auth && auth.user_accounts);
+  }
+
+  function authToken() {
+    if (state.auth && state.auth.accessToken) return state.auth.accessToken;
+    return state.prefs.token;
+  }
+
+  function hasCredentials() {
+    return Boolean(authToken());
   }
 
   function toast(message, type, duration) {
@@ -549,7 +664,7 @@
   }
 
   function loadSessions() {
-    var raw = readJSON(STORAGE.sessions, []);
+    var raw = readJSON(scopedStorageKey(STORAGE.sessions), []);
     if (!Array.isArray(raw)) return [];
     return raw
       .map(normalizeSession)
@@ -572,7 +687,7 @@
 
   function persistSessions() {
     if (!storageOk) return;
-    if (writeJSON(STORAGE.sessions, state.sessions)) return;
+    if (writeJSON(scopedStorageKey(STORAGE.sessions), state.sessions)) return;
     // 配额满：丢掉一半旧会话再试一次，至少保住当前对话。
     var keep = currentSession();
     state.sessions = state.sessions.slice(0, Math.max(1, Math.floor(state.sessions.length / 2)));
@@ -582,7 +697,7 @@
       });
       if (!present) state.sessions.unshift(keep);
     }
-    if (!writeJSON(STORAGE.sessions, state.sessions)) {
+    if (!writeJSON(scopedStorageKey(STORAGE.sessions), state.sessions)) {
       toast("本地存储已满，会话未能保存", "error");
     }
   }
@@ -594,7 +709,7 @@
   function persistCurrent() {
     if (!storageOk) return;
     try {
-      window.localStorage.setItem(STORAGE.current, state.currentId || "");
+      window.localStorage.setItem(scopedStorageKey(STORAGE.current), state.currentId || "");
     } catch (err) {
       /* 忽略：只影响刷新后恢复哪条会话 */
     }
@@ -602,7 +717,7 @@
 
   function loadCurrentId() {
     try {
-      var raw = window.localStorage.getItem(STORAGE.current);
+      var raw = window.localStorage.getItem(scopedStorageKey(STORAGE.current));
       if (!raw) return null;
       if (!state.sessions.some(function (session) { return session.id === raw; })) return null;
       return raw;
@@ -617,6 +732,19 @@
       if (state.sessions[i].id === state.currentId) return state.sessions[i];
     }
     return null;
+  }
+
+  // 登录 / 退出后切换到对应账号的本地会话作用域（云端会话同步是下一步）。
+  function reloadSessionScope() {
+    state.scopeVersion += 1;
+    state.currentId = loadCurrentId();
+    state.sessions = loadSessions();
+    renderSessionList();
+    renderChat();
+    updateComposerState();
+    if (state.currentId && dom.chatScroll) {
+      window.requestAnimationFrame(scrollToBottom);
+    }
   }
 
   function createSession(title) {
@@ -920,6 +1048,213 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* 账号 UI / 登录注册                                                  */
+  /* ------------------------------------------------------------------ */
+
+  var authMode = "login";
+
+  function accountInitial(user) {
+    var source = (user && (user.display_name || user.email)) || "?";
+    return String(source).trim().charAt(0).toUpperCase() || "?";
+  }
+
+  function updateAuthUI() {
+    var user = authUser();
+    var available = userAuthAvailable();
+
+    if (dom.accountLoginBtn) {
+      dom.accountLoginBtn.hidden = !available || Boolean(user);
+    }
+    if (dom.accountCard) {
+      dom.accountCard.hidden = !user;
+    }
+    if (user) {
+      if (dom.accountAvatar) dom.accountAvatar.textContent = accountInitial(user);
+      if (dom.accountName) {
+        dom.accountName.textContent = user.display_name || user.email || "已登录";
+      }
+      if (dom.accountEmail) dom.accountEmail.textContent = user.email || "";
+      if (dom.accountCard) dom.accountCard.title = user.email || "";
+    }
+    if (dom.bannerTokenBtn) {
+      dom.bannerTokenBtn.textContent = available ? "登录 / 注册" : "填写 Token";
+    }
+    if (dom.authBannerText) {
+      dom.authBannerText.textContent = available
+        ? "登录账号，或填写 JWT、API Key 或静态 AIP_TOKEN 后才能开始对话。"
+        : "填写 JWT、API Key 或静态 AIP_TOKEN 后才能开始对话。";
+    }
+    if (dom.settingsDialog) updateSettingsView();
+  }
+
+  function setAuthError(message) {
+    if (!dom.authError) return;
+    dom.authError.hidden = !message;
+    dom.authError.textContent = message || "";
+  }
+
+  function updateAuthSubmit() {
+    if (!dom.authSubmit) return;
+    dom.authSubmit.disabled = state.authBusy;
+    if (state.authBusy) {
+      dom.authSubmit.textContent = authMode === "register" ? "注册中…" : "登录中…";
+    } else {
+      dom.authSubmit.textContent = authMode === "register" ? "注册并登录" : "登录";
+    }
+  }
+
+  function setAuthMode(mode) {
+    authMode = mode === "register" ? "register" : "login";
+    var register = authMode === "register";
+
+    if (dom.authTabs) {
+      for (var i = 0; i < dom.authTabs.length; i += 1) {
+        var tab = dom.authTabs[i];
+        var active = tab.getAttribute("data-auth-tab") === authMode;
+        tab.classList.toggle("is-active", active);
+        tab.setAttribute("aria-selected", active ? "true" : "false");
+      }
+    }
+    if (dom.authTitle) dom.authTitle.textContent = register ? "创建账号" : "欢迎回来";
+    if (dom.authSubtitle) {
+      dom.authSubtitle.textContent = register
+        ? "注册后，会话和用量会绑定到你的账号。"
+        : "登录后，会话会绑定到你的账号。";
+    }
+    if (dom.authNameField) dom.authNameField.hidden = !register;
+    if (dom.authPassword) {
+      dom.authPassword.setAttribute("autocomplete", register ? "new-password" : "current-password");
+    }
+    if (dom.authSwitchText) {
+      dom.authSwitchText.textContent = register ? "已有账号？" : "还没有账号？";
+    }
+    if (dom.authSwitchBtn) {
+      dom.authSwitchBtn.textContent = register ? "去登录" : "立即注册";
+    }
+    setAuthError("");
+    updateAuthSubmit();
+  }
+
+  function openAuthDialog(mode) {
+    if (!userAuthAvailable()) {
+      if (state.config && state.config.auth_required) {
+        openSettings(true);
+        toast("当前后端未启用账号体系，请使用访问 Token", "warn", 5000);
+      } else {
+        toast("当前后端未启用用户账号（需要 PostgreSQL + AIP_JWT_SECRET）", "warn", 5000);
+      }
+      return;
+    }
+    setAuthMode(mode || "login");
+    if (dom.authEmail) {
+      dom.authEmail.value = "";
+      if (authMode === "login" && authUser()) dom.authEmail.value = authUser().email || "";
+    }
+    if (dom.authPassword) dom.authPassword.value = "";
+    if (dom.authName) dom.authName.value = "";
+    if (dom.authDialog && !dom.authDialog.open) dom.authDialog.showModal();
+    window.setTimeout(function () {
+      if (dom.authEmail) dom.authEmail.focus();
+    }, 30);
+  }
+
+  function closeAuthDialog() {
+    if (dom.authDialog && dom.authDialog.open) dom.authDialog.close();
+  }
+
+  function submitAuth(event) {
+    if (event) event.preventDefault();
+    if (state.authBusy) return;
+
+    var email = dom.authEmail ? dom.authEmail.value.trim() : "";
+    var password = dom.authPassword ? dom.authPassword.value : "";
+    var displayName = dom.authName ? dom.authName.value.trim() : "";
+    if (!email) {
+      setAuthError("请输入邮箱");
+      return;
+    }
+    if (password.length < 8 || password.length > 128) {
+      setAuthError("密码长度需要在 8~128 个字符之间");
+      return;
+    }
+
+    var mode = authMode;
+    var payload = { email: email, password: password };
+    if (mode === "register" && displayName) payload.display_name = displayName;
+
+    state.authBusy = true;
+    setAuthError("");
+    updateAuthSubmit();
+
+    fetch(mode === "register" ? "/v1/auth/register" : "/v1/auth/login", {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    })
+      .then(function (response) {
+        return response
+          .json()
+          .catch(function () {
+            return {};
+          })
+          .then(function (body) {
+            if (!response.ok) {
+              var message =
+                (body && body.error && body.error.message) ||
+                "请求失败（HTTP " + response.status + "）";
+              var error = new Error(message);
+              error.status = response.status;
+              throw error;
+            }
+            return body;
+          });
+      })
+      .then(function (pair) {
+        if (!applyTokenPair(pair)) throw new Error("登录返回的数据不完整");
+        stopStreaming();
+        reloadSessionScope();
+        closeAuthDialog();
+        updateServiceUI();
+        toast(
+          mode === "register" ? "注册成功，已登录" : "登录成功，已切换到账号会话",
+          "success",
+          3500
+        );
+      })
+      .catch(function (error) {
+        setAuthError(error.message || "登录失败，请稍后重试");
+      })
+      .then(function () {
+        state.authBusy = false;
+        updateAuthSubmit();
+      });
+  }
+
+  function logout() {
+    if (!authUser()) return;
+    if (!window.confirm("退出登录？本地会话仍会保留在该账号下。")) return;
+    stopStreaming();
+    clearAuth();
+    reloadSessionScope();
+    updateServiceUI();
+    toast("已退出登录，已切换回本地会话", "success");
+  }
+
+  function needsCredentials() {
+    return Boolean(state.config && state.config.auth_required && !hasCredentials());
+  }
+
+  function promptForCredentials() {
+    if (userAuthAvailable()) {
+      openAuthDialog("login");
+      toast("请先登录或注册", "warn");
+    } else {
+      openSettings(true);
+      toast("请先填写访问 Token", "warn");
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
   /* 服务状态 / 配置                                                      */
   /* ------------------------------------------------------------------ */
 
@@ -994,19 +1329,35 @@
     }
 
     var authRequired = Boolean(state.config && state.config.auth_required);
-    var hasToken = Boolean(state.prefs.token);
-    if (dom.authBanner) dom.authBanner.hidden = !(authRequired && !hasToken);
+    if (dom.authBanner) {
+      dom.authBanner.hidden = !(authRequired && !hasCredentials());
+    }
     if (dom.offlineBanner) {
       dom.offlineBanner.hidden = !(state.healthChecked && !state.health);
     }
-    if (dom.settingsDialog) updateSettingsView();
+    updateAuthUI();
   }
 
   function updateSettingsView() {
+    var authConfig = state.config && state.config.auth;
+    var accountMode = Boolean(authConfig && authConfig.user_accounts);
+    var user = authUser();
     if (dom.authState) {
       if (!state.config) {
         dom.authState.textContent = "尚未读取到服务配置";
         dom.authState.classList.remove("is-on");
+      } else if (accountMode) {
+        if (user) {
+          dom.authState.textContent =
+            "已登录：" + (user.email || "当前账号") + "；账号 Token 优先于下方手动 Token";
+          dom.authState.classList.remove("is-on");
+        } else if (state.prefs.token) {
+          dom.authState.textContent = "未登录；当前使用手动 Token。也可以登录账号。";
+          dom.authState.classList.add("is-on");
+        } else {
+          dom.authState.textContent = "服务已启用账号体系，请登录或注册后对话";
+          dom.authState.classList.add("is-on");
+        }
       } else if (state.config.auth_required) {
         dom.authState.textContent = state.prefs.token
           ? "服务要求 Token；若收到 401，请检查 Token 是否正确"
@@ -1018,9 +1369,15 @@
       }
     }
     if (dom.tokenInput) {
-      dom.tokenInput.placeholder = state.config && state.config.auth_required
-        ? "粘贴 AIP_TOKEN 对应的 Token"
-        : "未启用鉴权，可留空";
+      if (accountMode && user) {
+        dom.tokenInput.placeholder = "已登录；此处可填 API Key 或静态 AIP_TOKEN";
+      } else if (accountMode) {
+        dom.tokenInput.placeholder = "可选：API Key / 静态 AIP_TOKEN";
+      } else {
+        dom.tokenInput.placeholder = state.config && state.config.auth_required
+          ? "粘贴 AIP_TOKEN 对应的 Token"
+          : "未启用鉴权，可留空";
+      }
     }
     if (dom.infoEndpoint) dom.infoEndpoint.textContent = window.location.origin;
     if (dom.infoModel) {
@@ -1040,6 +1397,29 @@
       dom.infoVersion.textContent = state.config ? state.config.version || "—" : "—";
     }
     updateThemeButtons();
+  }
+
+  // 页面加载时用 /v1/auth/me 验证本地保存的 access token；过期则自动 refresh 一次。
+  function validateSession() {
+    if (!state.auth) return Promise.resolve();
+    return apiFetch("/v1/auth/me", { headers: { Accept: "application/json" } }, true)
+      .then(function (response) {
+        if (!response.ok) {
+          if (response.status === 401) handleAuthExpired();
+          return null;
+        }
+        return response.json().then(function (body) {
+          var user = normalizeUser(body && body.user);
+          if (!user || !state.auth) return;
+          state.auth.user = user;
+          persistAuth();
+          updateAuthUI();
+          updateSettingsView();
+        });
+      })
+      .catch(function () {
+        /* 网络失败不清理本地登录态；下一次请求还会再试 */
+      });
   }
 
   function loadConfig() {
@@ -1106,8 +1486,86 @@
   function authHeaders(withContentType) {
     var headers = { Accept: "application/json" };
     if (withContentType) headers["Content-Type"] = "application/json";
-    if (state.prefs.token) headers.Authorization = "Bearer " + state.prefs.token;
+    var token = authToken();
+    if (token) headers.Authorization = "Bearer " + token;
     return headers;
+  }
+
+  var refreshPromise = null;
+
+  // 只有登录/注册/刷新本身不应该再触发“401 后刷新”，其余接口（含 /v1/auth/me）
+  // 都可以在 access token 过期时自动换一次。
+  function isPublicAuthPath(url) {
+    return /\/v1\/auth\/(login|register|refresh)(?:\?|$)/.test(url);
+  }
+
+  function refreshSession() {
+    if (!state.auth || !state.auth.refreshToken) {
+      return Promise.reject(new Error("没有可用的 refresh token"));
+    }
+    if (refreshPromise) return refreshPromise;
+    var refreshToken = state.auth.refreshToken;
+    refreshPromise = fetch("/v1/auth/refresh", {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: refreshToken })
+    })
+      .then(function (response) {
+        if (!response.ok) throw new Error("刷新登录失败（HTTP " + response.status + "）");
+        return response.json();
+      })
+      .then(function (pair) {
+        if (!applyTokenPair(pair)) throw new Error("刷新登录返回无效");
+        return true;
+      })
+      .catch(function (error) {
+        // 不在这里清账号：调用方拿到 401 后再统一清理并切换本地会话作用域，
+        // 避免“state.auth 已空、但页面还停留在上一个账号会话”的中间态。
+        throw error;
+      })
+      .then(
+        function (value) {
+          refreshPromise = null;
+          return value;
+        },
+        function (error) {
+          refreshPromise = null;
+          throw error;
+        }
+      );
+    return refreshPromise;
+  }
+
+  // 带 Bearer 的 fetch：401 时用 refresh token 换一次新 access token，再重试一次。
+  // 流式请求也走这里；401 发生在响应头阶段，重试不会重复已经读到的 SSE 内容。
+  function apiFetch(url, init, retry) {
+    var options = init ? Object.assign({}, init) : {};
+    options.headers = Object.assign({}, options.headers || {}, authHeaders(false));
+    return fetch(url, options).then(function (response) {
+      var canRetry =
+        retry !== false &&
+        response.status === 401 &&
+        !isPublicAuthPath(url) &&
+        state.auth &&
+        state.auth.refreshToken;
+      if (!canRetry) return response;
+      return refreshSession()
+        .then(function () {
+          return apiFetch(url, init, false);
+        })
+        .catch(function () {
+          return response;
+        });
+    });
+  }
+
+  function handleAuthExpired() {
+    if (!state.auth) return;
+    stopStreaming();
+    clearAuth();
+    reloadSessionScope();
+    updateServiceUI();
+    toast("登录已过期，请重新登录", "warn", 5000);
   }
 
   function readApiError(response) {
@@ -1188,15 +1646,15 @@
       toast("消息超过 " + Math.round(maxBytes / 1024) + "KB 限制", "error");
       return;
     }
-    if (state.config && state.config.auth_required && !state.prefs.token) {
+    if (needsCredentials()) {
       if (dom.input) dom.input.value = text;
       autosizeInput();
       updateComposerState();
-      openSettings(true);
-      toast("请先填写访问 Token", "warn");
+      promptForCredentials();
       return;
     }
 
+    var scopeVersion = state.scopeVersion;
     var session = currentSession();
     if (!session) {
       session = createSession(text);
@@ -1249,7 +1707,7 @@
     var body = { message: text, stream: true };
     if (session.serverId) body.session_id = session.serverId;
 
-    fetch("/v1/chat/completions", {
+    apiFetch("/v1/chat/completions", {
       method: "POST",
       headers: authHeaders(true),
       body: JSON.stringify(body),
@@ -1259,9 +1717,16 @@
         if (!response.ok) {
           return readApiError(response).then(function (info) {
             if (response.status === 401) {
-              state.config = Object.assign({}, state.config, { auth_required: true });
-              updateServiceUI();
-              openSettings(true);
+              if (state.auth) {
+                handleAuthExpired();
+                openAuthDialog("login");
+              } else if (userAuthAvailable()) {
+                openAuthDialog("login");
+              } else {
+                state.config = Object.assign({}, state.config, { auth_required: true });
+                updateServiceUI();
+                openSettings(true);
+              }
             }
             throw new ApiError(info.message, response.status, info.type);
           });
@@ -1309,6 +1774,14 @@
         }
       })
       .then(function () {
+        if (scopeVersion !== state.scopeVersion) {
+          // 登录 / 退出 / 登录过期导致会话作用域切换：不要把这轮消息写进新账号的缓存。
+          state.streaming = false;
+          state.streamingMessageId = null;
+          state.abortController = null;
+          updateComposerState();
+          return;
+        }
         var endAt = window.performance && performance.now ? performance.now() : Date.now();
         assistant.elapsedMs = Math.max(1, Math.round(endAt - startedAt));
         if (assistant.state === "streaming") assistant.state = "done";
@@ -1411,9 +1884,8 @@
       toast("消息超过 " + Math.round(maxBytes / 1024) + "KB 限制", "error");
       return;
     }
-    if (state.config && state.config.auth_required && !state.prefs.token) {
-      openSettings(true);
-      toast("请先填写访问 Token", "warn");
+    if (needsCredentials()) {
+      promptForCredentials();
       return;
     }
     dom.input.value = "";
@@ -1427,12 +1899,11 @@
       toast("正在生成，请先停止或等待完成", "warn");
       return;
     }
-    if (state.config && state.config.auth_required && !state.prefs.token) {
+    if (needsCredentials()) {
       dom.input.value = prompt;
       autosizeInput();
       updateComposerState();
-      openSettings(true);
-      toast("请先填写访问 Token", "warn");
+      promptForCredentials();
       return;
     }
     sendMessage(prompt);
@@ -1473,8 +1944,13 @@
     closeSettings();
     if (token) toast("Token 已保存", "success");
     else toast("已清除 Token", "success");
-    if (state.config && state.config.auth_required && !token) {
-      toast("服务端启用了鉴权，未填写 Token 将无法对话", "warn");
+    if (state.config && state.config.auth_required && !hasCredentials()) {
+      toast(
+        userAuthAvailable()
+          ? "服务端启用了鉴权；请登录账号或填写 Token，否则无法对话"
+          : "服务端启用了鉴权，未填写 Token 将无法对话",
+        "warn"
+      );
     }
   }
 
@@ -1554,11 +2030,14 @@
   }
 
   function syncHistory(session) {
-    fetch("/v1/sessions/" + encodeURIComponent(session.serverId) + "/messages", {
+    apiFetch("/v1/sessions/" + encodeURIComponent(session.serverId) + "/messages", {
       headers: authHeaders(false)
     })
       .then(function (response) {
-        if (!response.ok) return null;
+        if (!response.ok) {
+          if (response.status === 401 && state.auth) handleAuthExpired();
+          return null;
+        }
         return response.json();
       })
       .then(function (data) {
@@ -1612,7 +2091,53 @@
     if (dom.settingsBtn) dom.settingsBtn.addEventListener("click", function () { openSettings(false); });
     if (dom.settingsBtnTop) dom.settingsBtnTop.addEventListener("click", function () { openSettings(false); });
     if (dom.themeBtn) dom.themeBtn.addEventListener("click", toggleTheme);
-    if (dom.bannerTokenBtn) dom.bannerTokenBtn.addEventListener("click", function () { openSettings(true); });
+    if (dom.bannerTokenBtn) {
+      dom.bannerTokenBtn.addEventListener("click", function () {
+        if (userAuthAvailable()) openAuthDialog("login");
+        else openSettings(true);
+      });
+    }
+    if (dom.accountLoginBtn) {
+      dom.accountLoginBtn.addEventListener("click", function () { openAuthDialog("login"); });
+    }
+    if (dom.accountLogoutBtn) dom.accountLogoutBtn.addEventListener("click", logout);
+    if (dom.authClose) dom.authClose.addEventListener("click", closeAuthDialog);
+    if (dom.authForm) dom.authForm.addEventListener("submit", submitAuth);
+    if (dom.authSwitchBtn) {
+      dom.authSwitchBtn.addEventListener("click", function () {
+        setAuthMode(authMode === "register" ? "login" : "register");
+        if (dom.authEmail) dom.authEmail.focus();
+      });
+    }
+    if (dom.authTokenBtn) {
+      dom.authTokenBtn.addEventListener("click", function () {
+        closeAuthDialog();
+        openSettings(true);
+      });
+    }
+    if (dom.authTabs) {
+      for (var tabIndex = 0; tabIndex < dom.authTabs.length; tabIndex += 1) {
+        dom.authTabs[tabIndex].addEventListener("click", function (event) {
+          var mode = event.currentTarget.getAttribute("data-auth-tab");
+          if (mode) setAuthMode(mode);
+        });
+      }
+    }
+    if (dom.authDialog) {
+      dom.authDialog.addEventListener("click", function (event) {
+        var rect = dom.authDialog.getBoundingClientRect();
+        var inside =
+          event.clientX >= rect.left &&
+          event.clientX <= rect.right &&
+          event.clientY >= rect.top &&
+          event.clientY <= rect.bottom;
+        if (!inside) closeAuthDialog();
+      });
+      dom.authDialog.addEventListener("close", function () {
+        state.authBusy = false;
+        updateAuthSubmit();
+      });
+    }
     if (dom.statusRetry) dom.statusRetry.addEventListener("click", retryConnection);
     if (dom.offlineRetryBtn) dom.offlineRetryBtn.addEventListener("click", retryConnection);
     if (dom.scrollBottomBtn) dom.scrollBottomBtn.addEventListener("click", scrollToBottom);
@@ -1783,7 +2308,29 @@
     dom.footerModel = $("#footerModel");
     dom.footerStorage = $("#footerStorage");
     dom.authBanner = $("#authBanner");
+    dom.authBannerText = $("#authBannerText");
     dom.bannerTokenBtn = $("#bannerTokenBtn");
+    dom.accountLoginBtn = $("#accountLoginBtn");
+    dom.accountCard = $("#accountCard");
+    dom.accountAvatar = $("#accountAvatar");
+    dom.accountName = $("#accountName");
+    dom.accountEmail = $("#accountEmail");
+    dom.accountLogoutBtn = $("#accountLogoutBtn");
+    dom.authDialog = $("#authDialog");
+    dom.authClose = $("#authClose");
+    dom.authForm = $("#authForm");
+    dom.authTabs = document.querySelectorAll("[data-auth-tab]");
+    dom.authTitle = $("#authTitle");
+    dom.authSubtitle = $("#authSubtitle");
+    dom.authNameField = $("#authNameField");
+    dom.authEmail = $("#authEmail");
+    dom.authPassword = $("#authPassword");
+    dom.authName = $("#authName");
+    dom.authError = $("#authError");
+    dom.authSubmit = $("#authSubmit");
+    dom.authSwitchText = $("#authSwitchText");
+    dom.authSwitchBtn = $("#authSwitchBtn");
+    dom.authTokenBtn = $("#authTokenBtn");
     dom.offlineBanner = $("#offlineBanner");
     dom.offlineRetryBtn = $("#offlineRetryBtn");
     dom.chatScroll = $("#chatScroll");
@@ -1816,7 +2363,9 @@
 
   function init() {
     cacheDom();
+    state.auth = loadAuth();
     state.prefs = normalizePrefs(readJSON(STORAGE.prefs, null));
+    migrateLegacyStorage();
     state.sessions = loadSessions();
     state.currentId = loadCurrentId();
 
@@ -1828,6 +2377,8 @@
     updateServiceUI();
 
     loadConfig().then(function () {
+      updateServiceUI();
+      validateSession();
       loadHealth();
     });
 

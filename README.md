@@ -13,6 +13,7 @@
 
 - ✅ HTTP 服务（**Drogon**，连接不占线程）：`/healthz`、`/v1/config`、`/v1/chat/completions`、`/v1/sessions/{id}/messages`
 - ✅ 内置 Web UI（零构建单页，编译进二进制）：流式对话、Markdown / 代码块、会话本地持久化、明暗主题、Token 设置
+- ✅ **Web 登录 / 注册**：邮箱密码注册登录、JWT access/refresh 自动刷新、退出登录；本地会话按账号隔离
 - ✅ SSE 流式输出，OpenAI 兼容的 chunk 格式（前端工具链可直接复用）
 - ✅ 模型网关：`Provider` 抽象 + OpenAI 兼容实现 + 离线 `mock` 实现
 - ✅ 上游 SSE 增量解析、非流式自动降级、上游错误映射
@@ -122,6 +123,26 @@ curl -sS http://127.0.0.1:8080/v1/auth/api-keys \
   只适合内网/演示。
 - JWT 需要 `AIP_STORAGE=postgres`（用户存 PostgreSQL）；memory 模式只支持静态 Token。
 
+### Web 界面登录
+
+启用账号体系后，打开 `http://127.0.0.1:8080/`，左下角会出现 **登录 / 注册**：
+
+```bash
+AIP_STORAGE=postgres \
+AIP_DB_DSN='postgresql://aiplatform:aiplatform@127.0.0.1:55432/aiplatform?connect_timeout=5' \
+AIP_JWT_SECRET="$(openssl rand -hex 32)" \
+AIP_AUTH_REQUIRED=1 \
+./build/aiplatform
+```
+
+- 登录成功后，页面把 access/refresh token 保存在浏览器 `localStorage`；access 过期时自动 refresh 一次，失败会回到登录框。
+- 本地会话按 `user_id` 隔离：未登录会话存在 `.anon` 作用域，退出登录后仍可看到；登录后的会话存在该账号作用域。
+- 未启用账号体系（memory 模式、没配 `AIP_JWT_SECRET`）时，页面回退到「填写 Token」，静态 `AIP_TOKEN` / API Key 仍可用。
+- `/v1/config` 的 `auth.user_accounts` 告诉前端是否展示登录入口；真正的鉴权仍由后端逐请求校验。
+
+> 当前是演示级存储：token 在 `localStorage`，生产必须走 HTTPS，并建议改成 httpOnly cookie / BFF 代理。
+> 云端会话列表同步还没接：目前登录主要解决账号身份、会话隔离和跨刷新保持登录。
+
 ### 配额与用量
 
 ```bash
@@ -193,6 +214,10 @@ AIP_WEB=false ./build/aiplatform
   "app": "AIPlatform", "version": "0.1.0", "api": "openai-compatible",
   "http": "drogon", "provider": "mock", "model": "deepseek-chat",
   "storage": "memory", "auth_required": false, "web": true,
+  "auth": {
+    "user_accounts": false, "password_login": false, "registration": false,
+    "static_token": false, "access_ttl_s": 900, "refresh_ttl_s": 604800
+  },
   "max_message_bytes": 32768, "max_streams": 512
 }
 ```

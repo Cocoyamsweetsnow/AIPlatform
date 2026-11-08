@@ -73,6 +73,11 @@
         <circle cx="8" cy="15" r="4"/><path d="m11 12 8-8M16 7l2 2M14 9l2 2"/>
       </g>
     </symbol>
+    <symbol id="i-logout" viewBox="0 0 24 24">
+      <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>
+      </g>
+    </symbol>
     <symbol id="i-alert" viewBox="0 0 24 24">
       <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
         <path d="M12 3.5 22 20H2L12 3.5Z"/><path d="M12 9.5v5M12 17.5v.01"/>
@@ -148,6 +153,23 @@
       <nav class="session-list" id="sessionList" aria-label="历史会话"></nav>
 
       <div class="sidebar-footer">
+        <div class="account-area">
+          <button class="account-login" id="accountLoginBtn" type="button" hidden>
+            <span class="account-avatar is-guest" aria-hidden="true"><svg class="icon"><use href="#i-key"></use></svg></span>
+            <span class="account-login-text"><strong>登录 / 注册</strong><span>登录后会话绑定账号</span></span>
+            <svg class="icon account-arrow"><use href="#i-chevron-down"></use></svg>
+          </button>
+          <div class="account-card" id="accountCard" hidden>
+            <span class="account-avatar" id="accountAvatar" aria-hidden="true">A</span>
+            <span class="account-info">
+              <strong id="accountName">已登录</strong>
+              <span id="accountEmail"></span>
+            </span>
+            <button class="icon-btn account-logout" id="accountLogoutBtn" type="button" aria-label="退出登录" title="退出登录">
+              <svg class="icon"><use href="#i-logout"></use></svg>
+            </button>
+          </div>
+        </div>
         <div class="status-card" id="statusCard">
           <span class="status-dot is-pending" id="statusDot"></span>
           <div class="status-text">
@@ -194,7 +216,7 @@
           <svg class="icon banner-icon"><use href="#i-key"></use></svg>
           <div class="banner-copy">
             <strong>此服务已启用访问鉴权</strong>
-            <span>填写 JWT、API Key 或静态 <code>AIP_TOKEN</code> 后才能开始对话。</span>
+            <span id="authBannerText">登录账号，或填写 JWT、API Key 或静态 <code>AIP_TOKEN</code> 后才能开始对话。</span>
           </div>
           <button class="btn btn-small" id="bannerTokenBtn" type="button">填写 Token</button>
         </div>
@@ -355,6 +377,54 @@
           <button class="btn" id="settingsCancel" type="button">取消</button>
           <button class="btn btn-primary" id="settingsSave" type="button">保存</button>
         </div>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="dialog auth-dialog" id="authDialog" aria-labelledby="authTitle">
+    <div class="auth-card">
+      <div class="auth-head">
+        <div class="auth-mark" aria-hidden="true">
+          <svg class="icon"><use href="#i-spark"></use></svg>
+        </div>
+        <button class="icon-btn" id="authClose" type="button" aria-label="关闭登录窗口">
+          <svg class="icon"><use href="#i-x"></use></svg>
+        </button>
+      </div>
+      <div class="auth-body">
+        <h2 id="authTitle">欢迎回来</h2>
+        <p class="auth-subtitle" id="authSubtitle">登录后，会话会绑定到你的账号。</p>
+
+        <div class="auth-tabs" role="tablist" aria-label="登录或注册">
+          <button type="button" data-auth-tab="login" role="tab" aria-selected="true">登录</button>
+          <button type="button" data-auth-tab="register" role="tab" aria-selected="false">注册</button>
+        </div>
+
+        <form id="authForm" novalidate>
+          <label class="auth-field" for="authEmail">
+            <span>邮箱</span>
+            <input id="authEmail" type="email" inputmode="email" autocomplete="email" maxlength="254"
+                   placeholder="you@example.com" required />
+          </label>
+          <label class="auth-field" for="authPassword">
+            <span>密码</span>
+            <input id="authPassword" type="password" autocomplete="current-password" maxlength="128"
+                   placeholder="至少 8 个字符" required />
+          </label>
+          <label class="auth-field" id="authNameField" for="authName" hidden>
+            <span>显示名称 <em>可选</em></span>
+            <input id="authName" type="text" autocomplete="nickname" maxlength="80"
+                   placeholder="怎么称呼你" />
+          </label>
+          <p class="auth-error" id="authError" role="alert" hidden></p>
+          <button class="auth-submit" id="authSubmit" type="submit">登录</button>
+        </form>
+
+        <p class="auth-switch">
+          <span id="authSwitchText">还没有账号？</span>
+          <button type="button" id="authSwitchBtn">立即注册</button>
+        </p>
+        <button class="auth-token-link" type="button" id="authTokenBtn">改用访问 Token</button>
       </div>
     </div>
   </dialog>
