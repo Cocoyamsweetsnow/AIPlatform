@@ -42,6 +42,7 @@
     prefs: { token: "", theme: "dark" },
     auth: null,
     authBusy: false,
+    authGate: false,
     scopeVersion: 0,
     streaming: false,
     streamingMessageId: null,
@@ -1162,6 +1163,24 @@
     if (dom.authDialog && dom.authDialog.open) dom.authDialog.close();
   }
 
+  // 账号模式下，未登录不允许进入聊天壳：复用登录弹窗，但铺满页面并禁止关闭。
+  // 静态 Token 模式不走这里，仍然使用原来的 banner + 设置面板。
+  function showAuthGate(mode) {
+    if (!userAuthAvailable()) return;
+    state.authGate = true;
+    document.body.classList.add("is-auth-gate");
+    if (dom.authDialog) dom.authDialog.classList.add("is-gate");
+    if (dom.settingsDialog && dom.settingsDialog.open) closeSettings();
+    openAuthDialog(mode || "login");
+  }
+
+  function hideAuthGate() {
+    state.authGate = false;
+    document.body.classList.remove("is-auth-gate");
+    if (dom.authDialog) dom.authDialog.classList.remove("is-gate");
+    closeAuthDialog();
+  }
+
   function submitAuth(event) {
     if (event) event.preventDefault();
     if (state.authBusy) return;
@@ -1212,8 +1231,9 @@
       .then(function (pair) {
         if (!applyTokenPair(pair)) throw new Error("登录返回的数据不完整");
         stopStreaming();
+        if (state.authGate) hideAuthGate();
+        else closeAuthDialog();
         reloadSessionScope();
-        closeAuthDialog();
         updateServiceUI();
         toast(
           mode === "register" ? "注册成功，已登录" : "登录成功，已切换到账号会话",
@@ -1237,16 +1257,18 @@
     clearAuth();
     reloadSessionScope();
     updateServiceUI();
-    toast("已退出登录，已切换回本地会话", "success");
+    if (userAuthAvailable()) showAuthGate("login");
+    else toast("已退出登录，已切换回本地会话", "success");
   }
 
   function needsCredentials() {
+    if (userAuthAvailable() && !authUser()) return true;
     return Boolean(state.config && state.config.auth_required && !hasCredentials());
   }
 
   function promptForCredentials() {
     if (userAuthAvailable()) {
-      openAuthDialog("login");
+      showAuthGate("login");
       toast("请先登录或注册", "warn");
     } else {
       openSettings(true);
@@ -1565,7 +1587,8 @@
     clearAuth();
     reloadSessionScope();
     updateServiceUI();
-    toast("登录已过期，请重新登录", "warn", 5000);
+    if (userAuthAvailable()) showAuthGate("login");
+    else toast("登录已过期，请重新登录", "warn", 5000);
   }
 
   function readApiError(response) {
@@ -2093,15 +2116,19 @@
     if (dom.themeBtn) dom.themeBtn.addEventListener("click", toggleTheme);
     if (dom.bannerTokenBtn) {
       dom.bannerTokenBtn.addEventListener("click", function () {
-        if (userAuthAvailable()) openAuthDialog("login");
+        if (userAuthAvailable()) showAuthGate("login");
         else openSettings(true);
       });
     }
     if (dom.accountLoginBtn) {
-      dom.accountLoginBtn.addEventListener("click", function () { openAuthDialog("login"); });
+      dom.accountLoginBtn.addEventListener("click", function () { showAuthGate("login"); });
     }
     if (dom.accountLogoutBtn) dom.accountLogoutBtn.addEventListener("click", logout);
-    if (dom.authClose) dom.authClose.addEventListener("click", closeAuthDialog);
+    if (dom.authClose) {
+      dom.authClose.addEventListener("click", function () {
+        if (!state.authGate) closeAuthDialog();
+      });
+    }
     if (dom.authForm) dom.authForm.addEventListener("submit", submitAuth);
     if (dom.authSwitchBtn) {
       dom.authSwitchBtn.addEventListener("click", function () {
@@ -2111,6 +2138,7 @@
     }
     if (dom.authTokenBtn) {
       dom.authTokenBtn.addEventListener("click", function () {
+        if (state.authGate) return;
         closeAuthDialog();
         openSettings(true);
       });
@@ -2131,7 +2159,10 @@
           event.clientX <= rect.right &&
           event.clientY >= rect.top &&
           event.clientY <= rect.bottom;
-        if (!inside) closeAuthDialog();
+        if (!inside && !state.authGate) closeAuthDialog();
+      });
+      dom.authDialog.addEventListener("cancel", function (event) {
+        if (state.authGate) event.preventDefault();
       });
       dom.authDialog.addEventListener("close", function () {
         state.authBusy = false;
@@ -2378,6 +2409,11 @@
 
     loadConfig().then(function () {
       updateServiceUI();
+      if (userAuthAvailable() && !authUser()) {
+        showAuthGate("login");
+      } else if (!userAuthAvailable()) {
+        hideAuthGate();
+      }
       validateSession();
       loadHealth();
     });

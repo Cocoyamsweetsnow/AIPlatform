@@ -186,8 +186,9 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 - `AIP_TOKEN` 仍然有效，视为管理员（可访问所有会话，但不能创建用户 API Key）。
 - `AIP_AUTH_REQUIRED=1` 时，`/healthz`、`/v1/config`、内置页面、`/v1/auth/register|login|refresh` 仍公开。
 - 用户/JWT 需要 PostgreSQL；memory 模式只支持静态 `AIP_TOKEN`。
-- Web UI 登录：同时配置 `AIP_STORAGE=postgres` 和 `AIP_JWT_SECRET` 后，打开 `/` 左下角会出现
-  「登录 / 注册」；access token 过期自动 refresh 一次。没配账号体系时页面回退到 Token 输入。
+- Web UI 登录：同时配置 `AIP_STORAGE=postgres` 和 `AIP_JWT_SECRET` 后，打开 `/` 会先显示
+  全屏登录 / 注册页，登录成功后才进入对话；access token 过期自动 refresh 一次。
+  没配账号体系时页面回退到 Token 输入。
 - 自动化验收：`./scripts/test_auth.sh`（临时 PG + 注册/登录/JWT/API Key/跨用户/撤销/刷新）。
 
 ### 2.4 配额与用量

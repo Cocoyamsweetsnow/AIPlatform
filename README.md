@@ -135,6 +135,7 @@ AIP_AUTH_REQUIRED=1 \
 ./build/aiplatform
 ```
 
+- 账号模式下，未登录会先显示**全屏登录 / 注册页**，登录成功后才进入对话；手动 Token 不能绕过账号登录。
 - 登录成功后，页面把 access/refresh token 保存在浏览器 `localStorage`；access 过期时自动 refresh 一次，失败会回到登录框。
 - 本地会话按 `user_id` 隔离：未登录会话存在 `.anon` 作用域，退出登录后仍可看到；登录后的会话存在该账号作用域。
 - 未启用账号体系（memory 模式、没配 `AIP_JWT_SECRET`）时，页面回退到「填写 Token」，静态 `AIP_TOKEN` / API Key 仍可用。
@@ -142,6 +143,9 @@ AIP_AUTH_REQUIRED=1 \
 
 > 当前是演示级存储：token 在 `localStorage`，生产必须走 HTTPS，并建议改成 httpOnly cookie / BFF 代理。
 > 云端会话列表同步还没接：目前登录主要解决账号身份、会话隔离和跨刷新保持登录。
+
+如果浏览器里还留着旧版登录态，页面可能直接进入对话：点左下角「退出登录」，或在 DevTools 执行
+`localStorage.removeItem('aiplatform.auth.v1')` 后刷新。旧的手动 Token 不会绕过账号登录闸门。
 
 ### 配额与用量
 

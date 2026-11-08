@@ -2320,6 +2320,51 @@ html[data-theme="light"] #themeBtn .icon-moon {
   width: min(430px, calc(100vw - 28px));
 }
 
+/* 账号模式登录闸门：复用 authDialog，但铺满页面、不可关闭。 */
+body.is-auth-gate .app-shell {
+  display: none;
+}
+
+.auth-dialog.is-gate {
+  width: 100vw;
+  max-width: none;
+  height: 100vh;
+  height: 100dvh;
+  max-height: none;
+  margin: 0;
+  border-radius: 0;
+  background:
+    radial-gradient(900px 520px at 50% -10%, rgba(125, 140, 255, 0.18), transparent 60%),
+    radial-gradient(700px 400px at 85% 110%, rgba(58, 232, 207, 0.12), transparent 60%),
+    var(--bg);
+  overflow-y: auto;
+}
+
+.auth-dialog.is-gate[open] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.auth-dialog.is-gate::backdrop {
+  background: var(--bg);
+}
+
+.auth-dialog.is-gate .auth-card {
+  width: min(430px, calc(100vw - 32px));
+  margin: auto;
+}
+
+.auth-dialog.is-gate .auth-head {
+  padding-top: 22px;
+}
+
+.auth-dialog.is-gate #authClose,
+.auth-dialog.is-gate .auth-token-link {
+  display: none;
+}
+
 .auth-card {
   overflow: hidden;
   border: 1px solid var(--border-strong);
@@ -2782,6 +2827,15 @@ html[data-theme="light"] #themeBtn .icon-moon {
 
   .auth-dialog {
     width: calc(100vw - 20px);
+  }
+
+  .auth-dialog.is-gate {
+    width: 100vw;
+    padding: 14px;
+  }
+
+  .auth-dialog.is-gate .auth-card {
+    width: 100%;
   }
 
   .auth-body {
