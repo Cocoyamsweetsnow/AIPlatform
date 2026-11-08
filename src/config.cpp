@@ -3,9 +3,32 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace platform {
 namespace {
+
+std::string trim(const std::string& s) {
+  const auto begin = s.find_first_not_of(" \t\r\n");
+  if (begin == std::string::npos) return {};
+  const auto end = s.find_last_not_of(" \t\r\n");
+  return s.substr(begin, end - begin + 1);
+}
+
+// 逗号分隔的多 key，忽略空项；顺序就是轮转顺序。
+std::vector<std::string> split_keys(const std::string& raw) {
+  std::vector<std::string> keys;
+  std::size_t start = 0;
+  while (start <= raw.size()) {
+    const std::size_t comma = raw.find(',', start);
+    const std::string item =
+        trim(raw.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+    if (!item.empty()) keys.push_back(item);
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return keys;
+}
 
 std::string env_str(const char* key, const std::string& fallback) {
   const char* v = std::getenv(key);
@@ -56,11 +79,15 @@ Config Config::from_env() {
   c.provider = env_str("AIP_PROVIDER", c.provider);
   c.base_url = env_str("AIP_BASE_URL", c.base_url);
   c.api_key = env_str("AIP_API_KEY", c.api_key);
+  c.api_keys = split_keys(env_str("AIP_API_KEYS", ""));
+  if (c.api_keys.empty() && !c.api_key.empty()) c.api_keys.push_back(c.api_key);
   c.model = env_str("AIP_MODEL", c.model);
   c.request_timeout_s = env_int("AIP_TIMEOUT_S", c.request_timeout_s);
   c.max_tokens = env_int("AIP_MAX_TOKENS", c.max_tokens);
   c.temperature = env_double("AIP_TEMPERATURE", c.temperature);
   c.include_usage = env_bool("AIP_INCLUDE_USAGE", c.include_usage);
+  c.max_retries = env_int("AIP_MAX_RETRIES", c.max_retries);
+  c.retry_base_ms = env_int("AIP_RETRY_BASE_MS", c.retry_base_ms);
 
   c.system_prompt = env_str("AIP_SYSTEM_PROMPT", c.system_prompt);
   c.max_history_messages = env_int("AIP_MAX_HISTORY", c.max_history_messages);
@@ -79,6 +106,12 @@ Config Config::from_env() {
   if (c.temperature < 0.0 || c.temperature > 2.0) {
     throw std::runtime_error("AIP_TEMPERATURE 应在 [0, 2] 区间");
   }
+  if (c.max_retries < 0 || c.max_retries > 5) {
+    throw std::runtime_error("AIP_MAX_RETRIES 应在 [0, 5]（0 表示不重试）");
+  }
+  if (c.retry_base_ms < 0 || c.retry_base_ms > 10000) {
+    throw std::runtime_error("AIP_RETRY_BASE_MS 应在 [0, 10000]");
+  }
   if (c.io_threads < 0 || c.io_threads > 64) {
     throw std::runtime_error("AIP_IO_THREADS 应在 [0, 64]（0 表示按核数自动）");
   }
@@ -93,9 +126,13 @@ Config Config::from_env() {
   if (c.provider != "mock" && c.provider != "openai") {
     throw std::runtime_error("AIP_PROVIDER 只支持 mock 或 openai，当前值: " + c.provider);
   }
-  if (c.provider == "openai" && c.api_key.empty()) {
+  if (c.provider == "openai" && c.api_keys.empty()) {
     throw std::runtime_error(
-        "AIP_PROVIDER=openai 时必须设置 AIP_API_KEY（也可以先用 AIP_PROVIDER=mock 离线联调）");
+        "AIP_PROVIDER=openai 时必须设置 AIP_API_KEY 或 AIP_API_KEYS"
+        "（也可以先用 AIP_PROVIDER=mock 离线联调）");
+  }
+  if (c.provider == "openai" && c.base_url.empty()) {
+    throw std::runtime_error("AIP_PROVIDER=openai 时 AIP_BASE_URL 不能为空");
   }
   return c;
 }

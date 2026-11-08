@@ -3,6 +3,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace platform {
 
@@ -16,12 +17,15 @@ struct Config {
   // 上游模型
   std::string provider{"mock"};  // mock | openai
   std::string base_url{"https://api.deepseek.com/v1"};
-  std::string api_key;
+  std::string api_key;                 // AIP_API_KEY（单 key，兼容旧配置）
+  std::vector<std::string> api_keys;   // AIP_API_KEYS（逗号分隔，非空时优先）
   std::string model{"deepseek-chat"};
   int request_timeout_s{120};
   int max_tokens{1024};
   double temperature{0.7};
   bool include_usage{true};
+  int max_retries{2};        // 上游失败重试次数（仅首 token 前）
+  int retry_base_ms{300};    // 指数退避基准；实际单次最多 5 秒
 
   // 对话
   std::string system_prompt{"你是一个乐于助人的 AI 助手，回答简洁准确。"};

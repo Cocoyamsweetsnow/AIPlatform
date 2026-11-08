@@ -2,14 +2,17 @@
 // 真实项目建议换 GoogleTest（见 docs/ROADMAP.md 的测试策略）。
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "chat/chat_service.h"
 #include "chat/session_store.h"
+#include "config.h"
 #include "http/public_config.h"
 #include "llm/event_queue.h"
+#include "llm/key_ring.h"
 #include "llm/mock_provider.h"
 #include "web/assets.h"
 
@@ -190,6 +193,43 @@ void test_web_assets() {
   CHECK(!web::is_public_asset("/v1/chat/completions"));
 }
 
+void test_key_ring_round_robin() {
+  llm::KeyRing ring({"key-a", "key-b", "key-c"});
+  CHECK(ring.size() == 3);
+  CHECK(ring.next() == "key-a");
+  CHECK(ring.next() == "key-b");
+  CHECK(ring.next() == "key-c");
+  CHECK(ring.next() == "key-a");  // 回到起点，保证多请求均匀分摊
+
+  llm::KeyRing empty({});
+  CHECK(empty.empty());
+  CHECK(empty.size() == 0);
+  CHECK(empty.next().empty());
+}
+
+void test_config_parses_api_keys() {
+  setenv("AIP_PROVIDER", "openai", 1);
+  setenv("AIP_API_KEY", "single-key", 1);
+  setenv("AIP_API_KEYS", " key-a , key-b ,, key-c ", 1);
+  setenv("AIP_MAX_RETRIES", "1", 1);
+  setenv("AIP_RETRY_BASE_MS", "50", 1);
+
+  const platform::Config config = platform::Config::from_env();
+  CHECK(config.api_keys.size() == 3);
+  CHECK(config.api_keys[0] == "key-a");
+  CHECK(config.api_keys[1] == "key-b");
+  CHECK(config.api_keys[2] == "key-c");
+  CHECK(config.api_key == "single-key");  // 兼容字段仍然保留
+  CHECK(config.max_retries == 1);
+  CHECK(config.retry_base_ms == 50);
+
+  unsetenv("AIP_PROVIDER");
+  unsetenv("AIP_API_KEY");
+  unsetenv("AIP_API_KEYS");
+  unsetenv("AIP_MAX_RETRIES");
+  unsetenv("AIP_RETRY_BASE_MS");
+}
+
 void test_public_config_has_no_secrets() {
   platform::Config config;
   config.api_token = "tok";
@@ -221,6 +261,8 @@ int main() {
   test_chat_service_records_history();
   test_cancel_is_idempotent();
   test_web_assets();
+  test_key_ring_round_robin();
+  test_config_parses_api_keys();
   test_public_config_has_no_secrets();
 
   if (g_failures == 0) {

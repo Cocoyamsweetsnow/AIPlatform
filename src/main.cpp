@@ -37,12 +37,16 @@ int main() {
     if (config.provider == "openai") {
       llm::OpenAiOptions options;
       options.base_url = config.base_url;
-      options.api_key = config.api_key;
+      options.api_keys = config.api_keys;
       options.default_model = config.model;
       options.timeout_s = config.request_timeout_s;
       options.include_usage = config.include_usage;
+      options.max_retries = config.max_retries;
+      options.retry_base_ms = config.retry_base_ms;
       provider = llm::make_openai_provider(std::move(options));
-      log_info("model gateway: " + config.base_url + " (model=" + config.model + ")");
+      log_info("model gateway: " + config.base_url + " (model=" + config.model +
+               ", keys=" + std::to_string(config.api_keys.size()) +
+               ", retries=" + std::to_string(config.max_retries) + ")");
     } else {
       provider = llm::make_mock_provider();
       log_info("model gateway: mock（离线模式，不消耗 token）");
