@@ -74,6 +74,21 @@ if ! curl -fsS "http://127.0.0.1:${APP_PORT}/healthz" >/dev/null 2>&1; then
 fi
 
 BASE="http://127.0.0.1:${APP_PORT}"
+
+# /v1/config 要告诉前端：账号体系可用，同时静态 Token 也可用；只能暴露能力，不能暴露密钥。
+CONFIG_JSON="$(curl -sS "$BASE/v1/config")"
+python3 - "$CONFIG_JSON" <<'PYCHECK'
+import json, sys
+config = json.loads(sys.argv[1])
+auth = config.get("auth") or {}
+assert auth.get("user_accounts") is True, auth
+assert auth.get("password_login") is True, auth
+assert auth.get("registration") is True, auth
+assert auth.get("static_token") is True, auth
+assert config.get("auth_required") is True, config
+assert "secret" not in json.dumps(config).lower(), config
+PYCHECK
+
 STATUS="$(curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
   -d '{"message":"no token"}' "$BASE/v1/chat/completions")"
 [[ "$STATUS" == "401" ]] || { echo "FAIL: 无 token 应为 401，实际 $STATUS" >&2; exit 1; }

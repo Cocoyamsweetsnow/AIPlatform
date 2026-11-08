@@ -13,6 +13,15 @@
 namespace http {
 
 inline std::string public_config_json(const platform::Config& config, const char* http_backend) {
+  // 账号体系需要同时满足：编译时带 AUTH、运行时用 PostgreSQL、且显式配置了
+  // JWT secret（否则进程重启后所有 token 会因随机 secret 失效，UI 不应引导用户注册）。
+#if defined(AIP_WITH_AUTH) && defined(AIP_WITH_POSTGRES)
+  const bool user_accounts =
+      config.postgres_enabled() && config.auth_enabled() && !config.jwt_secret.empty();
+#else
+  const bool user_accounts = false;
+#endif
+
   nlohmann::json body{
       {"app", "AIPlatform"},
       {"version", AIP_VERSION},
@@ -22,6 +31,13 @@ inline std::string public_config_json(const platform::Config& config, const char
       {"model", config.model},
       {"storage", config.storage},
       {"auth_required", config.auth_enabled()},
+      {"auth",
+       {{"user_accounts", user_accounts},
+        {"password_login", user_accounts},
+        {"registration", user_accounts},
+        {"static_token", !config.api_token.empty()},
+        {"access_ttl_s", config.jwt_ttl_s},
+        {"refresh_ttl_s", config.jwt_refresh_ttl_s}}},
       {"web", config.web_enabled},
       {"max_message_bytes", 32 * 1024},
       {"max_streams", config.max_streams},

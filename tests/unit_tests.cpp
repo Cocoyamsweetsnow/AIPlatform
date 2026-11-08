@@ -279,10 +279,33 @@ void test_public_config_has_no_secrets() {
   CHECK(parsed["http"] == "httplib");
   CHECK(parsed["storage"] == "memory");
   CHECK(parsed["web"] == true);
+  // memory 模式即使带静态 token，也没有用户账号体系；页面应回退到 Token 输入。
+  CHECK(parsed["auth"]["user_accounts"] == false);
+  CHECK(parsed["auth"]["static_token"] == true);
   // 公开接口绝不能带上密钥、上游地址或 system prompt。
   CHECK(body.find("sk-should-not-leak") == std::string::npos);
   CHECK(body.find("internal.example") == std::string::npos);
   CHECK(body.find("api_key") == std::string::npos);
+}
+
+void test_public_config_advertises_user_accounts() {
+#if defined(AIP_WITH_AUTH) && defined(AIP_WITH_POSTGRES)
+  platform::Config config;
+  config.storage = "postgres";
+  config.db_dsn = "postgresql://unused";
+  config.jwt_secret = "0123456789abcdef0123456789abcdef";
+  config.auth_required = true;
+
+  const auto parsed = nlohmann::json::parse(http::public_config_json(config, "drogon"));
+  CHECK(parsed["auth"]["user_accounts"] == true);
+  CHECK(parsed["auth"]["password_login"] == true);
+  CHECK(parsed["auth"]["registration"] == true);
+  CHECK(parsed["auth"]["static_token"] == false);
+  CHECK(parsed["auth"]["access_ttl_s"] == 900);
+  CHECK(parsed["auth"]["refresh_ttl_s"] == 7 * 24 * 3600);
+#else
+  std::printf("  skip: user auth not compiled in\n");
+#endif
 }
 
 }  // namespace
@@ -301,6 +324,7 @@ int main() {
   test_key_ring_round_robin();
   test_config_parses_api_keys();
   test_public_config_has_no_secrets();
+  test_public_config_advertises_user_accounts();
 
   if (g_failures == 0) {
     std::printf("all tests passed\n");
