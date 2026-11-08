@@ -117,6 +117,9 @@ export AIP_PROVIDER=openai
 export AIP_BASE_URL=https://api.deepseek.com/v1
 export AIP_API_KEY=sk-xxxxxxxx
 export AIP_MODEL=deepseek-chat
+# 可选：多 key 轮转 + 首 token 前重试（0 = 关闭）
+# export AIP_API_KEYS=sk-aaa,sk-bbb
+# export AIP_MAX_RETRIES=2
 ./build/aiplatform
 ```
 
@@ -138,6 +141,12 @@ export AIP_MODEL=deepseek-chat
 ```
 
 会依次验证：健康检查 → 流式对话 → 多轮上下文 → 会话历史 → 错误码（400/404）。
+
+上游重试单独验证（脚本自己起假上游和服务，使用 9099 / 8081 端口）：
+
+```bash
+./scripts/test_retry.sh
+```
 
 ### 2.4 并发冒烟（秒级，不是正式压测）
 

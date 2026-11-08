@@ -13,6 +13,8 @@
 - ✅ SSE 流式输出，OpenAI 兼容的 chunk 格式（前端工具链可直接复用）
 - ✅ 模型网关：`Provider` 抽象 + OpenAI 兼容实现 + 离线 `mock` 实现
 - ✅ 上游 SSE 增量解析、非流式自动降级、上游错误映射
+- ✅ 上游失败重试（仅首 token 前；408/409/425/429/5xx + 连接类错误，指数退避 + 抖动）
+- ✅ 多 API Key 轮转（`AIP_API_KEYS`，重试自动换 key）
 - ✅ 客户端断开 → 取消上游请求（不浪费 token）
 - ✅ 多轮上下文（内存会话存储，带 LRU 淘汰）
 - ✅ Bearer Token 鉴权、CORS、请求日志、统一错误码
@@ -69,6 +71,9 @@ export AIP_PROVIDER=openai
 export AIP_BASE_URL=https://api.deepseek.com/v1
 export AIP_API_KEY=sk-xxxxxxxx
 export AIP_MODEL=deepseek-chat
+# 可选：多 key 轮转（重试时自动换下一个），以及首 token 前重试次数
+# export AIP_API_KEYS=sk-aaa,sk-bbb
+# export AIP_MAX_RETRIES=2
 ./build/aiplatform
 ```
 
@@ -168,10 +173,20 @@ AIP_WEB=false ./build/aiplatform
 | 502 | `upstream_error` | 上游模型报错 |
 | 504 | `timeout` | 上游超时 |
 
+### 上游重试与多 Key
+
+- 只在「还没有向客户端吐第一个 token」时重试；已经吐字后失败直接发 `event: error`，避免前端看到重复内容。
+- 可重试：HTTP 408/409/425/429/5xx，以及连接/收包/发包类 curl 错误；401/403/400 等参数或鉴权错误不重试，总超时也不重试（避免把 120s 等待放大成 6 分钟）。
+- 退避：`AIP_RETRY_BASE_MS` 起步（默认 300ms）按 2 倍递增，单次最多 5s，另加 <100ms 抖动；`AIP_MAX_RETRIES=0` 关闭。
+- 多 Key：`AIP_API_KEYS=a,b,c` 按请求轮转，重试时自动换下一个。单 key 的熔断/配额还没做（阶段 4）。
+- 每次尝试仍受 `AIP_TIMEOUT_S` 限制；重试只增加次数，不共享总超时。
+- 重试会放大上游成本，默认 2 次是折中；成本敏感可设 0~1。
+
 ## 验证
 
 ```bash
 ./scripts/demo.sh                    # 冒烟测试（健康检查 / 流式 / 多轮 / 历史 / 错误码）
+./scripts/test_retry.sh              # 验证首 token 前重试（前 2 次 429，第 3 次成功）
 python3 scripts/fake_upstream.py &   # 假上游，验证 OpenAI 协议与错误路径
 ```
 
@@ -191,6 +206,7 @@ src/
 ├── web/assets.h              嵌入资源的查找接口（实现由 CMake 生成）
 ├── llm/                      模型网关
 │   ├── types.h               Provider / Stream / Event 接口
+│   ├── key_ring.h            多 API Key 轮转（原子游标）
 │   ├── event_queue.h         生产者-消费者队列
 │   ├── threaded_stream.h     后台线程 + 队列模板
 │   ├── openai_provider.cpp   OpenAI 兼容 + SSE 解析 + 取消
