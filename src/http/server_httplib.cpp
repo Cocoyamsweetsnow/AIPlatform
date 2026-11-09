@@ -16,6 +16,7 @@
 #include <chrono>
 #include <csignal>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -25,8 +26,11 @@
 #include "chat/replay_stream.h"
 #include "chat/token_estimate.h"
 #include "common/log.h"
+#include "common/metrics.h"
+#include "common/structured_log.h"
 #include "http/auth_json.h"
 #include "http/public_config.h"
+#include "http/request_context.h"
 #include "http/session_json.h"
 #include "httplib.h"
 #include "util/id.h"
@@ -41,6 +45,7 @@
 namespace http {
 namespace {
 
+namespace metrics = platform::metrics;
 using json = nlohmann::json;
 
 // 信号处理里只能调用 async-signal-safe 的东西，所以只存一个裸指针。
@@ -98,9 +103,9 @@ json chunk_base(const std::string& id, const std::string& model, long long creat
 
 void add_cors(httplib::Response& res) {
   res.set_header("Access-Control-Allow-Origin", "*");
-  res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-Id");
   res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.set_header("Access-Control-Expose-Headers", "X-Session-Id");
+  res.set_header("Access-Control-Expose-Headers", "X-Session-Id, X-Request-Id");
 }
 
 // 内置 Web UI：资源编译进二进制，只按 URL 精确查表，不接触文件系统。
@@ -120,7 +125,10 @@ void send_asset(httplib::Response& res, const web::Asset& asset) {
 
 // 不需要 Bearer Token 的公开路径：探针、前端配置、以及内置静态资源。
 bool is_public_path(const platform::Config& config, const std::string& path) {
-  if (path == "/healthz" || path == "/v1/config") return true;
+  if (path == "/healthz" || path == "/readyz" || path == "/metrics" ||
+      path == "/v1/config") {
+    return true;
+  }
   if (path == "/v1/auth/register" || path == "/v1/auth/login" ||
       path == "/v1/auth/refresh") {
     return true;
@@ -142,9 +150,35 @@ struct SseState {
   std::shared_ptr<llm::Stream> stream;
   std::string id;
   std::string model;
+  std::string request_id;
+  std::string session_id;
+  std::int64_t user_id = 0;
+  int prompt_tokens_estimate = 0;
+  bool include_usage = true;
   long long created = 0;
   bool sent_role = false;
+  bool client_cancelled = false;
+  bool saw_error = false;
+  std::size_t ascii_bytes = 0;
+  std::size_t non_ascii_codepoints = 0;
+  int prompt_tokens = -1;
+  int completion_tokens = -1;
+  std::string finish_reason = "stop";
+  std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+  std::optional<std::chrono::steady_clock::time_point> first_token_at;
 };
+
+// httplib 每个连接一个线程，因此 request 上下文可以放 thread_local；
+// pre_routing 写入，post_routing 统一输出结构化访问日志和 HTTP 指标。
+struct ThreadRequestContext {
+  std::string request_id;
+  std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+  std::int64_t user_id = 0;
+  std::string auth_type;
+  bool active = false;
+};
+
+thread_local ThreadRequestContext t_request;
 
 }  // namespace
 
@@ -195,7 +229,22 @@ void ApiServer::Impl::setup_routes() {
 
   server.set_pre_routing_handler(
       [this](const httplib::Request& req, httplib::Response& res) {
+        t_request.request_id = ensure_request_id(req.get_header_value("X-Request-Id"));
+        t_request.started = std::chrono::steady_clock::now();
+        t_request.active = true;
+        res.set_header("X-Request-Id", t_request.request_id);
         add_cors(res);
+
+        const auto deny = [&](int status, const std::string& type,
+                              const std::string& message, const char* reason) {
+          metrics::inc_auth_failure(reason);
+          platform::log_event_info(
+              "auth_failure",
+              json{{"request_id", t_request.request_id}, {"path", req.path},
+                   {"reason", reason}});
+          send_error(res, status, type, message);
+        };
+
         if (req.method == "OPTIONS") {
           res.status = 204;
           return httplib::Server::HandlerResponse::Handled;
@@ -216,18 +265,41 @@ void ApiServer::Impl::setup_routes() {
             }
           } catch (const std::exception& e) {
             platform::log_error(std::string("鉴权失败（存储）: ") + e.what());
-            send_error(res, 503, "storage_unavailable", "鉴权服务暂时不可用，请稍后重试");
+            deny(503, "storage_unavailable", "鉴权服务暂时不可用，请稍后重试",
+                 "storage_unavailable");
             return httplib::Server::HandlerResponse::Handled;
           }
         }
 #endif
-        send_error(res, 401, "unauthorized", "缺少或无效的 Authorization: Bearer <token>");
+        deny(401, "unauthorized", "缺少或无效的 Authorization: Bearer <token>",
+             token.has_value() ? "invalid_token" : "missing_token");
         return httplib::Server::HandlerResponse::Handled;
       });
 
   server.set_post_routing_handler([](const httplib::Request& req,
                                      const httplib::Response& res) {
-    platform::log_info(req.method + " " + req.path + " -> " + std::to_string(res.status));
+    const std::string& trace_id = t_request.request_id;
+    if (!trace_id.empty()) {
+      // res 在 post_routing 里是 const，header 已在 pre_routing / 各 handler 设置；
+      // 这里只保证 CORS 暴露头存在。
+    }
+    const double duration_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_request.started)
+            .count();
+    const std::string route = route_label(req.path);
+    metrics::inc_http_request(req.method, route, res.status);
+    metrics::observe_http_duration(req.method, route, duration_s);
+    platform::log_event_info(
+        "http_request",
+        json{{"request_id", trace_id},
+             {"method", req.method},
+             {"route", route},
+             {"path", req.path},
+             {"status", res.status},
+             {"duration_ms", static_cast<long long>(duration_s * 1000.0)},
+             {"user_id", t_request.user_id},
+             {"auth_type", t_request.auth_type}});
+    t_request.active = false;
   });
 
   server.Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
@@ -261,6 +333,41 @@ void ApiServer::Impl::setup_routes() {
   server.Get("/v1/config", [this](const httplib::Request&, httplib::Response& res) {
     res.set_content(public_config_json(config, "httplib"),
                     "application/json; charset=utf-8");
+  });
+
+  server.Get("/readyz", [this](const httplib::Request&, httplib::Response& res) {
+    bool storage_ok = true;
+    try {
+      (void)store.session_count();
+    } catch (const std::exception& e) {
+      storage_ok = false;
+      platform::log_warn(std::string("就绪检查读取会话数失败: ") + e.what());
+    }
+    metrics::set_ready(storage_ok);
+    if (!storage_ok) {
+      res.status = 503;
+      res.set_content(json{{"status", "not_ready"}, {"storage_ok", false}}.dump(),
+                      "application/json; charset=utf-8");
+      return;
+    }
+    res.set_content(json{{"status", "ready"}, {"storage_ok", true}}.dump(),
+                    "application/json; charset=utf-8");
+  });
+
+  server.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
+    if (!config.metrics_enabled) {
+      return send_error(res, 404, "not_found", "指标端点已禁用");
+    }
+    if (!config.metrics_token.empty()) {
+      const auto token = bearer_token(req.get_header_value("Authorization"));
+      if (!token.has_value() || !token_equals(*token, config.metrics_token)) {
+        metrics::inc_auth_failure("metrics_token");
+        return send_error(res, 401, "unauthorized", "缺少或无效的指标 Token");
+      }
+    }
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(metrics::render_prometheus(),
+                    "text/plain; version=0.0.4; charset=utf-8");
   });
 
 #ifdef AIP_WITH_AUTH
@@ -346,30 +453,41 @@ void ApiServer::Impl::setup_routes() {
 
 auth::Principal ApiServer::Impl::principal_from(const httplib::Request& req) const {
   auth::Principal principal;
+  const auto remember = [&principal] {
+    t_request.user_id = principal.user_id;
+    t_request.auth_type = principal.auth_type;
+    return principal;
+  };
+
   if (!config.auth_enabled()) {
     principal.is_admin = true;
     principal.auth_type = "local";
-    return principal;
+    return remember();
   }
 
   const auto token = bearer_token(req.get_header_value("Authorization"));
-  if (!token.has_value()) return principal;
+  if (!token.has_value()) return remember();
 
   if (!config.api_token.empty() && token_equals(*token, config.api_token)) {
     principal.is_admin = true;
     principal.auth_type = "static";
-    return principal;
+    return remember();
   }
 #ifdef AIP_WITH_AUTH
   if (auth != nullptr) {
     auto authenticated = auth->authenticate_bearer(*token);
-    if (authenticated.has_value()) return *authenticated;
+    if (authenticated.has_value()) {
+      principal = *authenticated;
+      return remember();
+    }
   }
 #endif
-  return principal;
+  return remember();
 }
 
 void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response& res) {
+  const std::string trace_id = t_request.request_id;
+  const auto chat_started = std::chrono::steady_clock::now();
   json body;
   try {
     body = json::parse(req.body);
@@ -557,11 +675,34 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
               json::array({{{"index", 0},
                             {"message", {{"role", "assistant"}, {"content", answer}}},
                             {"finish_reason", finish_reason}}})}};
-    if (prompt_tokens >= 0) {
-      out["usage"] = {{"prompt_tokens", prompt_tokens},
-                      {"completion_tokens", completion_tokens},
-                      {"total_tokens", prompt_tokens + completion_tokens}};
-    }
+    if (prompt_tokens < 0) prompt_tokens = chat::estimate_tokens(user_text) + 8;
+    if (completion_tokens < 0) completion_tokens = chat::estimate_tokens(answer);
+    out["usage"] = {{"prompt_tokens", prompt_tokens},
+                    {"completion_tokens", completion_tokens},
+                    {"total_tokens", prompt_tokens + completion_tokens}};
+
+    const auto elapsed = std::chrono::steady_clock::now() - chat_started;
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    metrics::inc_chat_request(/*stream=*/false, "completed");
+    metrics::observe_chat_latency(/*stream=*/false,
+                                  std::chrono::duration<double>(elapsed).count());
+    metrics::inc_tokens(model_name, "prompt", prompt_tokens);
+    metrics::inc_tokens(model_name, "completion", completion_tokens);
+    platform::log_event_info(
+        "chat_completion",
+        json{{"request_id", trace_id},
+             {"session_id", turn.session_id},
+             {"user_id", principal.user_id},
+             {"model", model_name},
+             {"stream", false},
+             {"outcome", "completed"},
+             {"finish_reason", finish_reason},
+             {"duration_ms", elapsed_ms},
+             {"ttft_ms", -1},
+             {"prompt_tokens", prompt_tokens},
+             {"completion_tokens", completion_tokens}});
+
     res.set_content(out.dump(), "application/json; charset=utf-8");
     return;
   }
@@ -570,12 +711,19 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
   state->stream = turn.stream;
   state->id = util::random_id("chatcmpl-");
   state->model = model_name;
+  state->request_id = trace_id;
+  state->session_id = turn.session_id;
+  state->user_id = principal.user_id;
+  state->prompt_tokens_estimate = estimate_request_tokens(user_text, config.max_tokens);
+  state->include_usage = true;
   state->created = util::now_ms() / 1000;
+  state->started = chat_started;
 
   res.set_header("Cache-Control", "no-cache, no-transform");
   res.set_header("X-Accel-Buffering", "no");  // 关闭 Nginx 缓冲，否则前端会一次性收到全部内容
 
   active_streams.fetch_add(1);
+  metrics::set_active_streams(active_streams.load());
   res.set_chunked_content_provider(
       "text/event-stream",
       [state, this](std::size_t /*offset*/, httplib::DataSink& sink) -> bool {
@@ -603,6 +751,16 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
 
         switch (ev.kind) {
           case llm::EventKind::Delta: {
+            if (!state->first_token_at.has_value()) {
+              state->first_token_at = std::chrono::steady_clock::now();
+            }
+            for (const unsigned char c : ev.text) {
+              if (c < 0x80) {
+                ++state->ascii_bytes;
+              } else if ((c & 0xC0) != 0x80) {
+                ++state->non_ascii_codepoints;
+              }
+            }
             if (!state->sent_role) {
               state->sent_role = true;
               json role_chunk = chunk_base(state->id, state->model, state->created);
@@ -618,14 +776,24 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
             break;
           }
           case llm::EventKind::Done: {
+            state->finish_reason =
+                ev.finish_reason.empty() ? "stop" : ev.finish_reason;
+            state->prompt_tokens =
+                ev.prompt_tokens >= 0 ? ev.prompt_tokens : state->prompt_tokens_estimate;
+            state->completion_tokens =
+                ev.completion_tokens >= 0
+                    ? ev.completion_tokens
+                    : static_cast<int>((state->ascii_bytes + 3) / 4 +
+                                       state->non_ascii_codepoints);
             json chunk = chunk_base(state->id, state->model, state->created);
             chunk["choices"] = json::array(
                 {{{"index", 0}, {"delta", json::object()},
-                  {"finish_reason", ev.finish_reason.empty() ? "stop" : ev.finish_reason}}});
-            if (ev.prompt_tokens >= 0) {
-              chunk["usage"] = {{"prompt_tokens", ev.prompt_tokens},
-                                {"completion_tokens", ev.completion_tokens},
-                                {"total_tokens", ev.prompt_tokens + ev.completion_tokens}};
+                  {"finish_reason", state->finish_reason}}});
+            if (state->include_usage) {
+              chunk["usage"] = {{"prompt_tokens", state->prompt_tokens},
+                                {"completion_tokens", state->completion_tokens},
+                                {"total_tokens",
+                                 state->prompt_tokens + state->completion_tokens}};
             }
             frame += sse_pack(chunk.dump());
             frame += sse_pack("[DONE]");
@@ -633,6 +801,7 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
             break;
           }
           case llm::EventKind::Error: {
+            state->saw_error = true;
             frame += sse_pack(json{{"error", {{"type", "upstream_error"}, {"message", ev.text}}}}
                                   .dump(),
                               "error");
@@ -643,13 +812,56 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
         }
 
         const bool ok = sink.write(frame.data(), frame.size());
+        if (!ok) state->client_cancelled = true;
         if (terminal) sink.done();
         return ok;
       },
       [state, this](bool /*success*/) {
-        // 响应结束（含客户端断开）时释放上游连接。
+        // 响应结束（含客户端断开）时释放上游连接，并记录最终指标。
         state->stream->cancel();
         active_streams.fetch_sub(1);
+        metrics::set_active_streams(active_streams.load());
+
+        if (state->prompt_tokens < 0) state->prompt_tokens = state->prompt_tokens_estimate;
+        if (state->completion_tokens < 0) {
+          state->completion_tokens = static_cast<int>((state->ascii_bytes + 3) / 4 +
+                                                      state->non_ascii_codepoints);
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - state->started;
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+        const int ttft_ms =
+            state->first_token_at.has_value()
+                ? static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       *state->first_token_at - state->started)
+                                       .count())
+                : -1;
+        const std::string outcome =
+            state->client_cancelled ? "cancelled" : (state->saw_error ? "error" : "completed");
+
+        metrics::inc_chat_request(/*stream=*/true, outcome);
+        metrics::observe_chat_latency(/*stream=*/true,
+                                      std::chrono::duration<double>(elapsed).count());
+        if (state->first_token_at.has_value()) {
+          metrics::observe_ttft(
+              state->model,
+              std::chrono::duration<double>(*state->first_token_at - state->started).count());
+        }
+        metrics::inc_tokens(state->model, "prompt", state->prompt_tokens);
+        metrics::inc_tokens(state->model, "completion", state->completion_tokens);
+        platform::log_event_info(
+            "chat_stream",
+            json{{"request_id", state->request_id},
+                 {"session_id", state->session_id},
+                 {"user_id", state->user_id},
+                 {"model", state->model},
+                 {"stream", true},
+                 {"outcome", outcome},
+                 {"finish_reason", state->finish_reason},
+                 {"duration_ms", elapsed_ms},
+                 {"ttft_ms", ttft_ms},
+                 {"prompt_tokens", state->prompt_tokens},
+                 {"completion_tokens", state->completion_tokens}});
       });
 }
 

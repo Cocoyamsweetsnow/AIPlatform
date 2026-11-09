@@ -38,8 +38,11 @@
 #include "chat/replay_stream.h"
 #include "chat/token_estimate.h"
 #include "common/log.h"
+#include "common/metrics.h"
+#include "common/structured_log.h"
 #include "http/auth_json.h"
 #include "http/public_config.h"
+#include "http/request_context.h"
 #include "http/session_json.h"
 #include "util/id.h"
 #include "web/assets.h"
@@ -53,6 +56,7 @@
 namespace http {
 namespace {
 
+namespace metrics = platform::metrics;
 using json = nlohmann::json;
 using drogon::HttpRequestPtr;
 using drogon::HttpResponsePtr;
@@ -118,7 +122,10 @@ HttpResponsePtr asset_response(const web::Asset& asset) {
 // 不需要 Bearer Token 的公开路径：探针、前端配置、以及内置静态资源。
 // 对话与历史接口仍然走鉴权。
 bool is_public_path(const platform::Config& config, const std::string& path) {
-  if (path == "/healthz" || path == "/v1/config") return true;
+  if (path == "/healthz" || path == "/readyz" || path == "/metrics" ||
+      path == "/v1/config") {
+    return true;
+  }
   if (path == "/v1/auth/register" || path == "/v1/auth/login" ||
       path == "/v1/auth/refresh") {
     return true;
@@ -136,9 +143,9 @@ bool token_equals(const std::string& a, const std::string& b) {
 
 void add_cors(const HttpResponsePtr& resp) {
   resp->addHeader("Access-Control-Allow-Origin", "*");
-  resp->addHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  resp->addHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-Id");
   resp->addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  resp->addHeader("Access-Control-Expose-Headers", "X-Session-Id");
+  resp->addHeader("Access-Control-Expose-Headers", "X-Session-Id, X-Request-Id");
 }
 
 HttpResponsePtr quota_error(const quota::QuotaDecision& decision) {
@@ -191,13 +198,17 @@ class StreamGate {
     while (current < max) {
       if (active_.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel,
                                         std::memory_order_relaxed)) {
+        metrics::set_active_streams(active_.load(std::memory_order_acquire));
         return true;
       }
     }
     return false;
   }
 
-  void leave() { active_.fetch_sub(1, std::memory_order_acq_rel); }
+  void leave() {
+    active_.fetch_sub(1, std::memory_order_acq_rel);
+    metrics::set_active_streams(active_.load(std::memory_order_acquire));
+  }
 
   std::size_t active() const { return active_.load(std::memory_order_acquire); }
 
@@ -236,13 +247,19 @@ class SsePump : public std::enable_shared_from_this<SsePump> {
  public:
   SsePump(std::shared_ptr<llm::Stream> stream, drogon::ResponseStreamPtr out, std::string id,
           std::string model, std::chrono::milliseconds heartbeat,
-          std::shared_ptr<StreamSlot> slot)
+          std::shared_ptr<StreamSlot> slot, std::string request_id, std::int64_t user_id,
+          std::string session_id, int prompt_tokens_estimate, bool include_usage)
       : stream_(std::move(stream)),
         out_(std::move(out)),
         id_(std::move(id)),
         model_(std::move(model)),
         heartbeat_(heartbeat),
-        slot_(std::move(slot)) {}
+        slot_(std::move(slot)),
+        request_id_(std::move(request_id)),
+        user_id_(user_id),
+        session_id_(std::move(session_id)),
+        prompt_tokens_estimate_(prompt_tokens_estimate),
+        include_usage_(include_usage) {}
 
   ~SsePump() {
     // 兜底：正常路径下 registry 已经 join 过，这里不会触发。
@@ -266,11 +283,27 @@ class SsePump : public std::enable_shared_from_this<SsePump> {
   bool finished() const { return finished_.load(std::memory_order_acquire); }
 
  private:
+  void add_text(const std::string& text) {
+    for (const unsigned char c : text) {
+      if (c < 0x80) {
+        ++ascii_bytes_;
+      } else if ((c & 0xC0) != 0x80) {
+        ++non_ascii_codepoints_;
+      }
+    }
+  }
+
+  int estimated_completion_tokens() const {
+    const int ascii_tokens = static_cast<int>((ascii_bytes_ + 3) / 4);
+    return ascii_tokens + static_cast<int>(non_ascii_codepoints_);
+  }
+
   void run() {
     const auto started = std::chrono::steady_clock::now();
     const long long created = now_s();
     bool sent_role = false;
     bool cancelled = false;
+    bool saw_error = false;
 
     while (true) {
       llm::Event ev;
@@ -299,6 +332,8 @@ class SsePump : public std::enable_shared_from_this<SsePump> {
 
       switch (ev.kind) {
         case llm::EventKind::Delta: {
+          if (!first_token_at_.has_value()) first_token_at_ = std::chrono::steady_clock::now();
+          add_text(ev.text);
           if (!sent_role) {
             sent_role = true;
             json role = chunk_base(id_, model_, created);
@@ -315,15 +350,20 @@ class SsePump : public std::enable_shared_from_this<SsePump> {
           break;
         }
         case llm::EventKind::Done: {
+          finish_reason_ = ev.finish_reason.empty() ? "stop" : ev.finish_reason;
+          prompt_tokens_ =
+              ev.prompt_tokens >= 0 ? ev.prompt_tokens : prompt_tokens_estimate_;
+          completion_tokens_ = ev.completion_tokens >= 0 ? ev.completion_tokens
+                                                         : estimated_completion_tokens();
           json chunk = chunk_base(id_, model_, created);
           chunk["choices"] = json::array(
               {{{"index", 0},
                 {"delta", json::object()},
-                {"finish_reason", ev.finish_reason.empty() ? "stop" : ev.finish_reason}}});
-          if (ev.prompt_tokens >= 0) {
-            chunk["usage"] = {{"prompt_tokens", ev.prompt_tokens},
-                              {"completion_tokens", ev.completion_tokens},
-                              {"total_tokens", ev.prompt_tokens + ev.completion_tokens}};
+                {"finish_reason", finish_reason_}}});
+          if (include_usage_) {
+            chunk["usage"] = {{"prompt_tokens", prompt_tokens_},
+                              {"completion_tokens", completion_tokens_},
+                              {"total_tokens", prompt_tokens_ + completion_tokens_}};
           }
           frame += sse_pack(chunk.dump());
           frame += sse_pack("[DONE]");
@@ -331,6 +371,7 @@ class SsePump : public std::enable_shared_from_this<SsePump> {
           break;
         }
         case llm::EventKind::Error: {
+          saw_error = true;
           frame += sse_pack(
               json{{"error", {{"type", "upstream_error"}, {"message", ev.text}}}}.dump(),
               "error");
@@ -353,16 +394,43 @@ class SsePump : public std::enable_shared_from_this<SsePump> {
     if (slot_) slot_->release();
     finished_.store(true, std::memory_order_release);
 
-    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - started)
-                                .count();
-    if (cancelled) {
-      // 取消要能看见：它直接对应「有没有白烧 token」。
-      platform::log_info("SSE 取消（客户端断开）: " + id_ + " " +
-                         std::to_string(elapsed_ms) + "ms");
-    } else {
-      platform::log_debug("SSE 完成: " + id_ + " " + std::to_string(elapsed_ms) + "ms");
+    if (prompt_tokens_ < 0) prompt_tokens_ = prompt_tokens_estimate_;
+    if (completion_tokens_ < 0) completion_tokens_ = estimated_completion_tokens();
+
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    const int ttft_ms =
+        first_token_at_.has_value()
+            ? static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   *first_token_at_ - started)
+                                   .count())
+            : -1;
+    const std::string outcome = cancelled ? "cancelled" : (saw_error ? "error" : "completed");
+
+    metrics::inc_chat_request(/*stream=*/true, outcome);
+    metrics::observe_chat_latency(/*stream=*/true,
+                                  std::chrono::duration<double>(elapsed).count());
+    if (first_token_at_.has_value()) {
+      metrics::observe_ttft(
+          model_, std::chrono::duration<double>(*first_token_at_ - started).count());
     }
+    metrics::inc_tokens(model_, "prompt", prompt_tokens_);
+    metrics::inc_tokens(model_, "completion", completion_tokens_);
+
+    platform::log_event_info(
+        "chat_stream",
+        json{{"request_id", request_id_},
+             {"session_id", session_id_},
+             {"user_id", user_id_},
+             {"model", model_},
+             {"stream", true},
+             {"outcome", outcome},
+             {"finish_reason", finish_reason_},
+             {"duration_ms", elapsed_ms},
+             {"ttft_ms", ttft_ms},
+             {"prompt_tokens", prompt_tokens_},
+             {"completion_tokens", completion_tokens_}});
   }
 
   std::shared_ptr<llm::Stream> stream_;
@@ -371,6 +439,17 @@ class SsePump : public std::enable_shared_from_this<SsePump> {
   const std::string model_;
   const std::chrono::milliseconds heartbeat_;
   std::shared_ptr<StreamSlot> slot_;
+  const std::string request_id_;
+  const std::int64_t user_id_;
+  const std::string session_id_;
+  const int prompt_tokens_estimate_;
+  const bool include_usage_;
+  std::size_t ascii_bytes_ = 0;
+  std::size_t non_ascii_codepoints_ = 0;
+  int prompt_tokens_ = -1;
+  int completion_tokens_ = -1;
+  std::string finish_reason_ = "stop";
+  std::optional<std::chrono::steady_clock::time_point> first_token_at_;
   std::thread thread_;
   std::atomic<bool> finished_{false};
 };
@@ -504,8 +583,13 @@ struct ApiServer::Impl {
 
   std::size_t io_threads() const;
   HttpResponsePtr health_response();
+  HttpResponsePtr ready_response();
+  HttpResponsePtr metrics_response(const HttpRequestPtr& req);
   HttpResponsePtr make_sse_response(std::shared_ptr<llm::Stream> stream, std::string id,
-                                    std::string model, std::shared_ptr<StreamSlot> slot);
+                                    std::string model, std::shared_ptr<StreamSlot> slot,
+                                    std::string request_id, std::int64_t user_id,
+                                    std::string session_id, int prompt_tokens_estimate,
+                                    bool include_usage);
   void pre_routing(const HttpRequestPtr& req, drogon::AdviceCallback&& callback,
                    drogon::AdviceChainCallback&& chain);
   auth::Principal principal_from(const HttpRequestPtr& req) const;
@@ -513,6 +597,7 @@ struct ApiServer::Impl {
   void handle_non_stream(const auth::Principal& principal, const std::string& session_id,
                          const std::string& user_text, const std::string& model,
                          const std::string& model_name, const std::string& request_id,
+                         const std::string& trace_id,
                          const std::shared_ptr<ResponseCallback>& callback);
   void handle_history(const HttpRequestPtr& req, ResponseCallback&& callback);
   void handle_sessions_list(const HttpRequestPtr& req, ResponseCallback&& callback);
@@ -575,14 +660,63 @@ void ApiServer::Impl::setup() {
   drogon::app().registerPreSendingAdvice(
       [](const HttpRequestPtr& req, const HttpResponsePtr& resp) {
         add_cors(resp);
-        platform::log_info(std::string(req->methodString()) + " " + req->path() + " -> " +
-                           std::to_string(static_cast<int>(resp->statusCode())));
+
+        std::string trace_id;
+        std::int64_t user_id = 0;
+        std::string auth_type;
+        double duration_s = 0.0;
+        if (const auto& attrs = req->attributes(); attrs) {
+          if (attrs->find("request_id")) trace_id = attrs->get<std::string>("request_id");
+          if (attrs->find("request_started")) {
+            const auto started =
+                attrs->get<std::chrono::steady_clock::time_point>("request_started");
+            duration_s =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
+                    .count();
+          }
+          if (attrs->find("principal")) {
+            const auto& principal = attrs->get<auth::Principal>("principal");
+            user_id = principal.user_id;
+            auth_type = principal.auth_type;
+          }
+        }
+        if (trace_id.empty()) trace_id = util::random_id("req_");
+        resp->addHeader("X-Request-Id", trace_id);
+
+        const int status = static_cast<int>(resp->statusCode());
+        const std::string route = route_label(req->path());
+        metrics::inc_http_request(req->methodString(), route, status);
+        metrics::observe_http_duration(req->methodString(), route, duration_s);
+        platform::log_event_info(
+            "http_request",
+            json{{"request_id", trace_id},
+                 {"method", req->methodString()},
+                 {"route", route},
+                 {"path", req->path()},
+                 {"status", status},
+                 {"duration_ms", static_cast<long long>(duration_s * 1000.0)},
+                 {"user_id", user_id},
+                 {"auth_type", auth_type}});
       });
 
   drogon::app().registerHandler(
       "/healthz",
       [this](const HttpRequestPtr&, ResponseCallback&& callback) {
         callback(health_response());
+      },
+      {drogon::Get});
+
+  drogon::app().registerHandler(
+      "/readyz",
+      [this](const HttpRequestPtr&, ResponseCallback&& callback) {
+        callback(ready_response());
+      },
+      {drogon::Get});
+
+  drogon::app().registerHandler(
+      "/metrics",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        callback(metrics_response(req));
       },
       {drogon::Get});
 
@@ -707,6 +841,10 @@ void ApiServer::Impl::setup() {
 
 void ApiServer::Impl::pre_routing(const HttpRequestPtr& req, drogon::AdviceCallback&& callback,
                                   drogon::AdviceChainCallback&& chain) {
+  const std::string trace_id = ensure_request_id(req->getHeader("x-request-id"));
+  req->attributes()->insert("request_id", trace_id);
+  req->attributes()->insert("request_started", std::chrono::steady_clock::now());
+
   if (req->method() == drogon::Options) {
     auto resp = drogon::HttpResponse::newHttpResponse();
     resp->setStatusCode(drogon::k204NoContent);
@@ -714,7 +852,9 @@ void ApiServer::Impl::pre_routing(const HttpRequestPtr& req, drogon::AdviceCallb
     return;
   }
 
-  if (shutting_down.load(std::memory_order_acquire) && req->path() != "/healthz") {
+  if (shutting_down.load(std::memory_order_acquire) && req->path() != "/healthz" &&
+      req->path() != "/readyz") {
+    metrics::set_ready(false);
     callback(error_response(drogon::k503ServiceUnavailable, "shutting_down",
                             "服务正在退出，请稍后重试"));
     return;
@@ -725,10 +865,19 @@ void ApiServer::Impl::pre_routing(const HttpRequestPtr& req, drogon::AdviceCallb
     return;
   }
 
+  const auto deny = [&](drogon::HttpStatusCode status, const std::string& type,
+                        const std::string& message, const char* reason) {
+    metrics::inc_auth_failure(reason);
+    platform::log_event_info("auth_failure", json{{"request_id", trace_id},
+                                                  {"path", req->path()},
+                                                  {"reason", reason}});
+    callback(error_response(status, type, message));
+  };
+
   const auto token = bearer_token(req->getHeader("authorization"));
   if (!token.has_value()) {
-    callback(error_response(drogon::k401Unauthorized, "unauthorized",
-                            "缺少 Authorization: Bearer <token>"));
+    deny(drogon::k401Unauthorized, "unauthorized", "缺少 Authorization: Bearer <token>",
+         "missing_token");
     return;
   }
 
@@ -744,8 +893,8 @@ void ApiServer::Impl::pre_routing(const HttpRequestPtr& req, drogon::AdviceCallb
 
 #ifdef AIP_WITH_AUTH
   if (auth_ == nullptr) {
-    callback(error_response(drogon::k401Unauthorized, "unauthorized",
-                            "Token 无效（当前构建未启用用户鉴权）"));
+    deny(drogon::k401Unauthorized, "unauthorized",
+         "Token 无效（当前构建未启用用户鉴权）", "auth_unavailable");
     return;
   }
 
@@ -756,7 +905,7 @@ void ApiServer::Impl::pre_routing(const HttpRequestPtr& req, drogon::AdviceCallb
 
   // JWT/API Key 需要查 users/api_keys；放到 db_workers，避免阻塞 IO 线程。
   const bool queued = db_workers.submit(
-      [this, token_value, req_ptr, chain_ptr, callback_ptr] {
+      [this, token_value, req_ptr, trace_id, chain_ptr, callback_ptr] {
         std::optional<auth::Principal> principal;
         std::optional<HttpResponsePtr> auth_error;
         try {
@@ -770,12 +919,18 @@ void ApiServer::Impl::pre_routing(const HttpRequestPtr& req, drogon::AdviceCallb
 
         auto* loop = drogon::app().getLoop();
         if (loop == nullptr) return;
-        loop->queueInLoop([req_ptr, principal, auth_error, chain_ptr, callback_ptr] {
+        loop->queueInLoop([req_ptr, principal, auth_error, trace_id, chain_ptr, callback_ptr] {
           if (auth_error.has_value()) {
             (*callback_ptr)(*auth_error);
             return;
           }
           if (!principal.has_value()) {
+            metrics::inc_auth_failure("invalid_token");
+            platform::log_event_info(
+                "auth_failure",
+                json{{"request_id", trace_id},
+                     {"path", req_ptr->path()},
+                     {"reason", "invalid_token"}});
             (*callback_ptr)(error_response(drogon::k401Unauthorized, "unauthorized",
                                            "Token 无效或已过期"));
             return;
@@ -837,16 +992,56 @@ HttpResponsePtr ApiServer::Impl::health_response() {
   return json_ok(body);
 }
 
-HttpResponsePtr ApiServer::Impl::make_sse_response(std::shared_ptr<llm::Stream> stream,
-                                                   std::string id, std::string model,
-                                                   std::shared_ptr<StreamSlot> slot) {
+HttpResponsePtr ApiServer::Impl::ready_response() {
+  bool storage_ok = true;
+  try {
+    (void)store.session_count();
+  } catch (const std::exception& e) {
+    storage_ok = false;
+    platform::log_warn(std::string("就绪检查读取会话数失败: ") + e.what());
+  }
+  const bool ready = storage_ok && !shutting_down.load(std::memory_order_acquire);
+  metrics::set_ready(ready);
+  if (!ready) {
+    return error_response(drogon::k503ServiceUnavailable, "not_ready",
+                          storage_ok ? "服务正在退出" : "存储暂时不可用");
+  }
+  return json_ok(json{{"status", "ready"}, {"storage_ok", true}});
+}
+
+HttpResponsePtr ApiServer::Impl::metrics_response(const HttpRequestPtr& req) {
+  if (!config.metrics_enabled) {
+    return error_response(drogon::k404NotFound, "not_found", "指标端点已禁用");
+  }
+  if (!config.metrics_token.empty()) {
+    const auto token = bearer_token(req->getHeader("authorization"));
+    if (!token.has_value() || !token_equals(*token, config.metrics_token)) {
+      metrics::inc_auth_failure("metrics_token");
+      return error_response(drogon::k401Unauthorized, "unauthorized",
+                            "缺少或无效的指标 Token");
+    }
+  }
+  auto resp = body_response(metrics::render_prometheus(),
+                            "text/plain; version=0.0.4; charset=utf-8");
+  resp->addHeader("Cache-Control", "no-store");
+  return resp;
+}
+
+HttpResponsePtr ApiServer::Impl::make_sse_response(
+    std::shared_ptr<llm::Stream> stream, std::string id, std::string model,
+    std::shared_ptr<StreamSlot> slot, std::string request_id, std::int64_t user_id,
+    std::string session_id, int prompt_tokens_estimate, bool include_usage) {
   // disableKickoffTimeout=true：真实模型首字可能要十几秒，不能让 trantor 的 kickoff
   // 超时把还没出字的流掐掉（我们有 15s 心跳会主动探测连接）。
   auto resp = drogon::HttpResponse::newAsyncStreamResponse(
       [this, stream = std::move(stream), id = std::move(id), model = std::move(model),
-       slot = std::move(slot)](drogon::ResponseStreamPtr out) mutable {
-        auto pump = std::make_shared<SsePump>(std::move(stream), std::move(out), std::move(id),
-                                              std::move(model), heartbeat, std::move(slot));
+       slot = std::move(slot), request_id = std::move(request_id), user_id,
+       session_id = std::move(session_id), prompt_tokens_estimate,
+       include_usage](drogon::ResponseStreamPtr out) mutable {
+        auto pump = std::make_shared<SsePump>(
+            std::move(stream), std::move(out), std::move(id), std::move(model), heartbeat,
+            std::move(slot), std::move(request_id), user_id, std::move(session_id),
+            prompt_tokens_estimate, include_usage);
         pumps.add(pump);
         pump->start();
       },
@@ -940,14 +1135,18 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
 
   const std::string model_name = model.empty() ? config.model : model;
   const auth::Principal principal = principal_from(req);
+  std::string trace_id;
+  if (const auto& attrs = req->attributes(); attrs && attrs->find("request_id")) {
+    trace_id = attrs->get<std::string>("request_id");
+  }
 
   if (!stream) {
     auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
     const bool queued = workers.submit(
-        [this, principal, session_id, user_text, model, model_name, request_id,
+        [this, principal, session_id, user_text, model, model_name, request_id, trace_id,
          shared_callback] {
           handle_non_stream(principal, session_id, user_text, model, model_name, request_id,
-                            shared_callback);
+                            trace_id, shared_callback);
         });
     if (!queued) {
       (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
@@ -967,7 +1166,7 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
 
   // 会话读写放到独立线程池：Drogon 的 IO 线程只做 epoll/send，不在这里等 PostgreSQL。
   const bool queued = db_workers.submit(
-      [this, principal, session_id, user_text, model, model_name, request_id, slot,
+      [this, principal, session_id, user_text, model, model_name, request_id, trace_id, slot,
        shared_callback] {
         chat::ChatService::Turn turn;
         const std::string scope = principal.scope();
@@ -999,9 +1198,12 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
               auto* replay_loop = drogon::app().getLoop();
               if (replay_loop == nullptr) return;
               replay_loop->queueInLoop(
-                  [this, replay, dedup, model_name, slot, shared_callback]() mutable {
-                    auto resp = make_sse_response(replay, util::random_id("chatcmpl-"),
-                                                  model_name, std::move(slot));
+                  [this, replay, dedup, model_name, trace_id, principal, slot,
+                   shared_callback]() mutable {
+                    auto resp = make_sse_response(
+                        replay, util::random_id("chatcmpl-"), model_name, std::move(slot),
+                        trace_id, principal.user_id, dedup.session_id, 0,
+                        /*include_usage=*/false);
                     resp->addHeader("X-Session-Id", dedup.session_id);
                     (*shared_callback)(resp);
                   });
@@ -1064,10 +1266,13 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
         auto* loop = drogon::app().getLoop();
         if (loop == nullptr) return;  // 退出中：turn/slot 析构会取消上游并释放名额
         loop->queueInLoop(
-            [this, turn = std::move(turn), model_name, slot, shared_callback]() mutable {
-              auto resp = make_sse_response(std::move(turn.stream),
-                                            util::random_id("chatcmpl-"), model_name,
-                                            std::move(slot));
+            [this, turn = std::move(turn), model_name, trace_id, principal, slot,
+             user_text, shared_callback]() mutable {
+              auto resp = make_sse_response(
+                  std::move(turn.stream), util::random_id("chatcmpl-"), model_name,
+                  std::move(slot), trace_id, principal.user_id, turn.session_id,
+                  estimate_request_tokens(user_text, config.max_tokens),
+                  /*include_usage=*/true);
               resp->addHeader("X-Session-Id", turn.session_id);
               (*shared_callback)(resp);
             });
@@ -1085,7 +1290,9 @@ void ApiServer::Impl::handle_non_stream(const auth::Principal& principal,
                                         const std::string& user_text, const std::string& model,
                                         const std::string& model_name,
                                         const std::string& request_id,
+                                        const std::string& trace_id,
                                         const std::shared_ptr<ResponseCallback>& callback) {
+  const auto started = std::chrono::steady_clock::now();
   chat::ChatService::Turn turn;
   const std::string scope = principal.scope();
   auto mark_failed = [this, &scope, &request_id](const std::string& type,
@@ -1225,6 +1432,34 @@ void ApiServer::Impl::handle_non_stream(const auth::Principal& principal,
                     {"completion_tokens", completion_tokens},
                     {"total_tokens", prompt_tokens + completion_tokens}};
   }
+
+  if (prompt_tokens < 0) {
+    prompt_tokens = chat::estimate_tokens(user_text) + 8;
+  }
+  if (completion_tokens < 0) {
+    completion_tokens = chat::estimate_tokens(answer);
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  const auto elapsed_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+  metrics::inc_chat_request(/*stream=*/false, "completed");
+  metrics::observe_chat_latency(/*stream=*/false,
+                                std::chrono::duration<double>(elapsed).count());
+  metrics::inc_tokens(model_name, "prompt", prompt_tokens);
+  metrics::inc_tokens(model_name, "completion", completion_tokens);
+  platform::log_event_info(
+      "chat_completion",
+      json{{"request_id", trace_id},
+           {"session_id", turn.session_id},
+           {"user_id", principal.user_id},
+           {"model", model_name},
+           {"stream", false},
+           {"outcome", "completed"},
+           {"finish_reason", finish_reason},
+           {"duration_ms", elapsed_ms},
+           {"ttft_ms", -1},
+           {"prompt_tokens", prompt_tokens},
+           {"completion_tokens", completion_tokens}});
 
   auto resp = json_ok(out);
   resp->addHeader("X-Session-Id", turn.session_id);
@@ -1875,6 +2110,7 @@ void ApiServer::Impl::post(const std::shared_ptr<ResponseCallback>& callback,
 
 bool ApiServer::Impl::run() {
   setup();
+  metrics::set_ready(true);
 
   drogon::app().setTermSignalHandler([this] { begin_shutdown(); });
   drogon::app().setIntSignalHandler([this] { begin_shutdown(); });
@@ -1897,6 +2133,7 @@ void ApiServer::Impl::begin_shutdown() {
     return;
   }
 
+  metrics::set_ready(false);
   platform::log_info("收到退出信号：停止接收新对话，等待在途流收尾（最长 " +
                      std::to_string(config.shutdown_drain_s) + "s）");
 

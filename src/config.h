@@ -13,6 +13,10 @@ struct Config {
   int port{8080};
   std::string api_token;  // 为空表示不鉴权（仅本地开发）
   bool web_enabled{true};  // 是否提供内置 Web UI（AIP_WEB=false 可切成纯 API 模式）
+  std::string log_format{"json"};  // text | json
+  bool metrics_enabled{true};      // AIP_METRICS_ENABLED
+  std::string metrics_token;       // 非空时 /metrics 需要 Bearer Token
+  bool trust_proxy{false};         // 信任 X-Forwarded-For（部署在 Nginx 后时开启）
 
   // 上游模型
   std::string provider{"mock"};  // mock | openai

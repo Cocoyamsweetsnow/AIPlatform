@@ -8,6 +8,7 @@
 #include "chat/chat_service.h"
 #include "chat/session_store.h"
 #include "common/log.h"
+#include "common/metrics.h"
 #include "config.h"
 #include "http/server.h"
 #include "llm/mock_provider.h"
@@ -46,6 +47,13 @@ int main() {
   try {
     const Config config = Config::from_env();
     set_log_level(parse_level(std::getenv("AIP_LOG_LEVEL")));
+    set_log_format(config.log_format == "json" ? LogFormat::Json : LogFormat::Text);
+#if defined(AIP_HTTP_BACKEND_DROGON)
+    constexpr const char* kHttpBackend = "drogon";
+#else
+    constexpr const char* kHttpBackend = "httplib";
+#endif
+    metrics::set_build_info(AIP_VERSION, kHttpBackend, config.provider);
 
     std::unique_ptr<llm::Provider> provider;
     if (config.provider == "openai") {

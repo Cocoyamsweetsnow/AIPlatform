@@ -83,6 +83,8 @@ endif()
 set(AIP_CORE_SOURCES
   src/config.cpp
   src/util/id.cpp
+  src/common/metrics.cpp
+  src/common/structured_log.cpp
   src/llm/mock_provider.cpp
   src/llm/openai_provider.cpp
   src/chat/session_store.cpp
@@ -160,6 +162,8 @@ endif()
 
 if(AIPLATFORM_HTTP STREQUAL "drogon")
   # Drogon 必须 >= 1.9.14：newAsyncStreamResponse 在 1.9.0 里还不存在。
+  # 某些发行版/本地构建用 Boost.UUID 替代 libuuid，DrogonConfig 会要求 Boost::boost。
+  find_package(Boost QUIET)
   find_package(Drogon CONFIG REQUIRED)
   target_sources(ai_core PRIVATE src/http/server_drogon.cpp)
   target_link_libraries(ai_core PUBLIC Drogon::Drogon)

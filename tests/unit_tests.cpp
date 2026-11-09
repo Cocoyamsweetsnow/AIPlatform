@@ -10,8 +10,10 @@
 #include "auth/principal.h"
 #include "chat/chat_service.h"
 #include "chat/session_store.h"
+#include "common/metrics.h"
 #include "config.h"
 #include "http/public_config.h"
+#include "http/request_context.h"
 #include "llm/event_queue.h"
 #include "llm/key_ring.h"
 #include "llm/mock_provider.h"
@@ -308,6 +310,36 @@ void test_public_config_advertises_user_accounts() {
 #endif
 }
 
+
+void test_metrics_and_request_id() {
+  platform::metrics::reset_for_tests();
+  platform::metrics::inc_http_request("GET", "/healthz", 200);
+  platform::metrics::inc_http_request("GET", "/healthz", 200);
+  platform::metrics::observe_ttft("demo", 0.2);
+  platform::metrics::set_active_streams(3);
+
+  const std::string text = platform::metrics::render_prometheus();
+  CHECK(text.find(
+            "aip_http_requests_total{method=\"GET\",route=\"/healthz\",status=\"200\"} 2") !=
+        std::string::npos);
+  CHECK(text.find("aip_chat_ttft_seconds_bucket{model=\"demo\",le=\"+Inf\"} 1") !=
+        std::string::npos);
+  CHECK(text.find("aip_active_streams 3") != std::string::npos);
+  CHECK(text.find("aip_http_request_duration_seconds_count{method=\"GET\",route=\"/healthz\"} 0") ==
+        std::string::npos);
+
+  CHECK(http::valid_request_id("abc-123_X.Y"));
+  CHECK(!http::valid_request_id("bad id"));
+  CHECK(!http::valid_request_id(""));
+  CHECK(http::ensure_request_id("client-id") == "client-id");
+  CHECK(http::ensure_request_id("bad id").rfind("req_", 0) == 0);
+  CHECK(http::route_label("/v1/sessions/s_abc/messages") == "/v1/sessions/{id}/messages");
+  CHECK(http::route_label("/v1/sessions/s_abc") == "/v1/sessions/{id}");
+  CHECK(http::route_label("/v1/auth/api-keys/12") == "/v1/auth/api-keys/{id}");
+  CHECK(http::route_label("/assets/app.js") == "/assets/*");
+  platform::metrics::reset_for_tests();
+}
+
 }  // namespace
 
 int main() {
@@ -325,6 +357,7 @@ int main() {
   test_config_parses_api_keys();
   test_public_config_has_no_secrets();
   test_public_config_advertises_user_accounts();
+  test_metrics_and_request_id();
 
   if (g_failures == 0) {
     std::printf("all tests passed\n");

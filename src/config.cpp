@@ -75,6 +75,10 @@ Config Config::from_env() {
   c.port = env_int("AIP_PORT", c.port);
   c.api_token = env_str("AIP_TOKEN", c.api_token);
   c.web_enabled = env_bool("AIP_WEB", c.web_enabled);
+  c.log_format = env_str("AIP_LOG_FORMAT", c.log_format);
+  c.metrics_enabled = env_bool("AIP_METRICS_ENABLED", c.metrics_enabled);
+  c.metrics_token = env_str("AIP_METRICS_TOKEN", c.metrics_token);
+  c.trust_proxy = env_bool("AIP_TRUST_PROXY", c.trust_proxy);
 
   c.provider = env_str("AIP_PROVIDER", c.provider);
   c.base_url = env_str("AIP_BASE_URL", c.base_url);
@@ -119,6 +123,9 @@ Config Config::from_env() {
   while (!c.base_url.empty() && c.base_url.back() == '/') c.base_url.pop_back();
 
   if (c.port <= 0 || c.port > 65535) throw std::runtime_error("AIP_PORT 超出范围");
+  if (c.log_format != "text" && c.log_format != "json") {
+    throw std::runtime_error("AIP_LOG_FORMAT 只支持 text 或 json，当前值: " + c.log_format);
+  }
   if (c.max_tokens <= 0) throw std::runtime_error("AIP_MAX_TOKENS 必须为正数");
   if (c.max_context_tokens < 1024 || c.max_context_tokens > 1000000) {
     throw std::runtime_error("AIP_MAX_CONTEXT_TOKENS 应在 [1024, 1000000]");

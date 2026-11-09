@@ -1,5 +1,6 @@
 # ---- 构建产物 -----------------------------------------------------------
 build/
+.deps/
 # build-poc / build-drogon / build-httplib 等
 build-*/
 cmake-build-*/

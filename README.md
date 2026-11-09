@@ -30,7 +30,8 @@
 - ✅ 请求幂等：`request_id` 重放非流式/流式结果，`in_progress` 409，崩溃 TTL 自动恢复
 - ✅ 会话管理：列表/改名/软删除；历史支持 `limit`，跨用户 404
 - ✅ token 预算上下文：按估算 token 裁剪 system + 历史 + user，超预算 413 `context_too_long`
-- ✅ CORS、请求日志、统一错误码
+- ✅ CORS、结构化请求日志、`X-Request-Id`、统一错误码
+- ✅ 可观测性：`/metrics`（Prometheus）、`/readyz`、TTFT/token/upstream 指标
 - ✅ 流数量准入（超出 `AIP_MAX_STREAMS` 直接 503）、SSE 心跳
 - ✅ 优雅退出（SIGTERM → 停止接新请求 → 等在途流收尾 → 退出）
 - ✅ 单元测试、Docker 多阶段构建、CI（含 Drogon 镜像冒烟）
@@ -300,9 +301,42 @@ AIP_WEB=false ./build/aiplatform
  "web":true,"http":"drogon"}
 // 正在退出（仍返回 200，避免 liveness 探针误杀；LB 应看 draining 摘流量）
 {"status":"draining","draining":true,...}
-// 存储不可用（仍返回 200，storage_ok=false；后续会加 readiness）
+// 存储不可用（仍返回 200，storage_ok=false；就绪探针请改用 /readyz）
 {"status":"degraded","storage":"postgres","storage_ok":false,...}
 ```
+
+### `GET /readyz`
+
+严格就绪探针：存储不可用或服务正在退出时返回 **503**，其余返回
+`{"status":"ready","storage_ok":true}`。K8s readinessProbe / LB 应看这个接口，
+`/healthz` 保留给 liveness（避免数据库短暂抖动把进程杀掉）。
+
+### `GET /metrics`
+
+Prometheus text exposition（`text/plain; version=0.0.4`）。默认开启，可用
+`AIP_METRICS_ENABLED=false` 关闭；设置 `AIP_METRICS_TOKEN` 后需要
+`Authorization: Bearer <token>`。核心指标：
+
+| 指标 | 说明 |
+|---|---|
+| `aip_http_requests_total{method,route,status}` | HTTP 请求量；`route` 已归一化，避免会话 ID 打爆基数 |
+| `aip_http_request_duration_seconds` | HTTP 时延直方图 |
+| `aip_chat_requests_total{stream,outcome}` | 对话完成 / 取消 / 错误 |
+| `aip_chat_ttft_seconds` | 首 token 延迟直方图 |
+| `aip_chat_tokens_total{model,type}` | prompt / completion token 用量 |
+| `aip_active_streams` | 当前在途 SSE 流 |
+| `aip_quota_rejections_total{type}` | 配额/限流拒绝 |
+| `aip_upstream_requests_total{model,outcome}` | 上游尝试结果（后续接 Key 熔断） |
+| `aip_ready` | 就绪状态 0/1 |
+
+### 结构化日志与 request_id
+
+- `AIP_LOG_FORMAT=json` 时所有日志都是一行 JSON；默认即 `json`，可切回 `text`。
+- 每个请求都有 `X-Request-Id`：客户端可传（1~128 位字母/数字/`-_.`），否则服务端生成；
+  响应头原样返回，日志字段 `request_id` 可用于全链路检索。
+- 请求结束打 `event=http_request`；流结束打 `event=chat_stream`，包含
+  `request_id/user_id/session_id/model/outcome/duration_ms/ttft_ms/prompt_tokens/completion_tokens`。
+- 不记录用户消息正文与 `Authorization` 头。
 
 ### `GET /v1/config`
 
