@@ -1,0 +1,60 @@
+# Prometheus 告警规则示例。配合 /metrics 使用；阈值按实际 SLO 调整。
+groups:
+  - name: aiplatform
+    rules:
+      - alert: AIPlatformHigh5xxRate
+        expr: |
+          sum(rate(aip_http_requests_total{status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(aip_http_requests_total[5m])), 0.001)
+          > 0.01
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "AIPlatform 5xx 比例超过 1%"
+
+      - alert: AIPlatformReadyDown
+        expr: aip_ready == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "AIPlatform /readyz 不就绪（存储或退出中）"
+
+      - alert: AIPlatformTTFTP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(aip_chat_ttft_seconds_bucket[5m])) by (le)
+          ) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "对话首 token p95 超过 5s"
+
+      - alert: AIPlatformUpstreamFailure
+        expr: |
+          sum(rate(aip_upstream_requests_total{outcome=~"retryable|fatal|keys_unavailable"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "上游模型请求持续失败（重试/熔断/Key 不可用）"
+
+      - alert: AIPlatformQuotaRejectionBurst
+        expr: sum(rate(aip_quota_rejections_total[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "配额/限流拒绝持续偏高，检查定价或滥用"
+
+      - alert: AIPlatformNoActiveStreamsMetric
+        expr: absent(aip_ready)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "抓不到 AIPlatform 指标（实例挂了或 /metrics 被关闭）"

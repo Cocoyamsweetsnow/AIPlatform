@@ -183,7 +183,8 @@ export AIP_MAX_TOKENS=1024           # 其中给 completion 预留
 `ChatService` 按 `system + 最近历史 + 本轮 user` 估算 token，装不下就裁掉更早的历史；
 system + user 都放不下时直接返回 `413 context_too_long`，不调用上游。
 估算不是 tokenizer，长中文/代码会有偏差；`AIP_MAX_TOKENS` 必须小于
-`AIP_MAX_CONTEXT_TOKENS`。
+`AIP_MAX_CONTEXT_TOKENS`。`AIP_MAX_TOKENS` 是**默认输出上限**；客户端可用请求级
+`max_tokens` 覆盖，硬上限是 `AIP_MAX_CONTEXT_TOKENS - 64`。
 
 接真实模型（任何 OpenAI 兼容接口）：
 
@@ -396,6 +397,9 @@ Prometheus text exposition（`text/plain; version=0.0.4`）。默认开启，可
 | `aip_quota_rejections_total{type}` | 配额/限流拒绝 |
 | `aip_upstream_requests_total{model,outcome}` | 上游尝试结果（后续接 Key 熔断） |
 | `aip_ready` | 就绪状态 0/1 |
+
+告警规则示例见 [deploy/prometheus-alerts.yml](deploy/prometheus-alerts.yml)（5xx 比例、
+就绪探针、TTFT p95、上游失败、配额拒绝、指标断供）。
 
 ### 结构化日志与 request_id
 
