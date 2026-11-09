@@ -29,6 +29,7 @@
 #include "common/metrics.h"
 #include "common/structured_log.h"
 #include "http/auth_json.h"
+#include "http/chat_request.h"
 #include "http/public_config.h"
 #include "http/request_context.h"
 #include "http/session_json.h"
@@ -65,10 +66,6 @@ void send_error(httplib::Response& res, int status, const std::string& type,
   res.set_content(json_error(type, message), "application/json; charset=utf-8");
 }
 
-bool is_blank(const std::string& s) {
-  return s.find_first_not_of(" \t\r\n") == std::string::npos;
-}
-
 void send_quota_error(httplib::Response& res, const quota::QuotaDecision& decision) {
   send_error(res, 429, decision.type, decision.message);
   res.set_header("Retry-After", std::to_string(std::max(1, decision.retry_after_s)));
@@ -76,6 +73,33 @@ void send_quota_error(httplib::Response& res, const quota::QuotaDecision& decisi
 
 int estimate_request_tokens(const std::string& text, int max_tokens) {
   return chat::estimate_tokens(text) + std::max(0, max_tokens) + 8;
+}
+
+int effective_max_tokens(const http::ChatRequestInput& input, int fallback) {
+  return input.max_tokens > 0 ? input.max_tokens : fallback;
+}
+
+chat::ChatService::StartOptions to_start_options(const http::ChatRequestInput& input) {
+  chat::ChatService::StartOptions options;
+  options.session_id = input.session_id;
+  options.user_text = input.user_text;
+  options.messages = input.messages;
+  options.model_override = input.model;
+  options.request_id = input.request_id;
+  options.temperature = input.temperature;
+  options.max_tokens = input.max_tokens;
+  options.top_p = input.top_p;
+  options.stop = input.stop;
+  options.has_presence_penalty = input.has_presence_penalty;
+  options.presence_penalty = input.presence_penalty;
+  options.has_frequency_penalty = input.has_frequency_penalty;
+  options.frequency_penalty = input.frequency_penalty;
+  options.has_seed = input.has_seed;
+  options.seed = input.seed;
+  options.response_format = input.response_format;
+  options.user = input.user;
+  options.include_usage = input.include_usage;
+  return options;
 }
 
 void send_idempotency_busy(httplib::Response& res) {
@@ -404,6 +428,35 @@ void ApiServer::Impl::setup_routes() {
                handle_static(req, res);
              });
 
+  server.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
+    json data = json::array();
+    for (const auto& model : config.models) {
+      data.push_back(json{{"id", model},
+                          {"object", "model"},
+                          {"created", 0},
+                          {"owned_by", "aiplatform"}});
+    }
+    res.set_content(json{{"object", "list"}, {"data", data}}.dump(),
+                    "application/json; charset=utf-8");
+  });
+
+  server.Get(R"(/v1/models/([A-Za-z0-9._:\-]+))",
+             [this](const httplib::Request& req, httplib::Response& res) {
+               const std::string requested = req.matches[1];
+               for (const auto& model : config.models) {
+                 if (model == requested) {
+                   res.set_content(json{{"id", model},
+                                        {"object", "model"},
+                                        {"created", 0},
+                                        {"owned_by", "aiplatform"}}
+                                       .dump(),
+                                   "application/json; charset=utf-8");
+                   return;
+                 }
+               }
+               send_error(res, 404, "model_not_found", "模型不存在: " + requested);
+             });
+
   server.Post("/v1/chat/completions",
               [this](const httplib::Request& req, httplib::Response& res) {
                 handle_chat(req, res);
@@ -494,67 +547,17 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
   } catch (const std::exception&) {
     return send_error(res, 400, "invalid_json", "请求体不是合法 JSON");
   }
-  if (!body.is_object()) {
-    return send_error(res, 400, "invalid_json", "请求体必须是 JSON 对象");
-  }
 
-  std::string user_text;
-  if (body.contains("message") && body["message"].is_string()) {
-    user_text = body["message"].get<std::string>();
-  } else if (body.contains("messages") && body["messages"].is_array()) {
-    // 兼容 OpenAI 原生格式：取最后一条 user 作为本轮输入。
-    for (const auto& m : body["messages"]) {
-      if (m.is_object() && m.value("role", "") == "user" && m.contains("content") &&
-          m["content"].is_string()) {
-        user_text = m["content"].get<std::string>();
-      }
-    }
+  http::ChatParseError parse_error;
+  auto parsed = http::parse_chat_request(body, config, parse_error);
+  if (!parsed.has_value()) {
+    return send_error(res, parse_error.status, parse_error.type, parse_error.message);
   }
-  if (is_blank(user_text)) {
-    return send_error(res, 400, "invalid_request",
-                      "缺少 message 字段（或 messages 中最后一条 user 消息为空）");
-  }
-  if (user_text.size() > 32 * 1024) {
-    return send_error(res, 413, "payload_too_large", "单条消息超过 32KB 限制");
-  }
-
-  // 逐字段校验类型：body.value() 在字段类型不对时会抛 type_error（→ 500），
-  // 客户端传错类型应该得到 400。
-  std::string session_id;
-  if (body.contains("session_id")) {
-    if (!body["session_id"].is_string()) {
-      return send_error(res, 400, "invalid_request", "session_id 必须是字符串");
-    }
-    session_id = body["session_id"].get<std::string>();
-  }
-  std::string model;
-  if (body.contains("model")) {
-    if (!body["model"].is_string()) {
-      return send_error(res, 400, "invalid_request", "model 必须是字符串");
-    }
-    model = body["model"].get<std::string>();
-  }
-  bool stream = true;
-  if (body.contains("stream")) {
-    if (!body["stream"].is_boolean()) {
-      return send_error(res, 400, "invalid_request", "stream 必须是布尔值");
-    }
-    stream = body["stream"].get<bool>();
-  }
-
-  std::string request_id;
-  if (body.contains("request_id")) {
-    if (!body["request_id"].is_string()) {
-      return send_error(res, 400, "invalid_request", "request_id 必须是字符串");
-    }
-    request_id = body["request_id"].get<std::string>();
-    if (request_id.empty() || request_id.size() > 128) {
-      return send_error(res, 400, "invalid_request", "request_id 长度应在 1~128");
-    }
-  }
-
+  const http::ChatRequestInput& input = *parsed;
+  const std::string model_name = input.model.empty() ? config.model : input.model;
   const auth::Principal principal = principal_from(req);
   const std::string scope = principal.scope();
+  const std::string& request_id = input.request_id;
   auto mark_failed = [this, &scope, &request_id](const std::string& type,
                                                  const std::string& message) {
     if (request_id.empty() || idempotency == nullptr) return;
@@ -592,8 +595,12 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
       quota::QuotaGuard guard;
       if (quota != nullptr) {
         auto acquired = quota->try_acquire(
-            principal, estimate_request_tokens(user_text, config.max_tokens), daily_used);
+            principal,
+            estimate_request_tokens(input.user_text,
+                                    effective_max_tokens(input, config.max_tokens)),
+            daily_used);
         if (!acquired.decision.allowed) {
+          metrics::inc_quota_rejection(acquired.decision.type);
           mark_failed("rate_limited", acquired.decision.message);
           return send_quota_error(res, acquired.decision);
         }
@@ -604,8 +611,7 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
       if (!request_id.empty() && idempotency != nullptr) {
         observer = std::make_shared<chat::IdempotencyObserver>(*idempotency, scope, request_id);
       }
-      turn = service.start(principal, session_id, user_text, model, request_id,
-                           std::move(guard), observer);
+      turn = service.start(principal, to_start_options(input), std::move(guard), observer);
     }
   } catch (const chat::ContextTooLong& e) {
     mark_failed("context_too_long", e.what());
@@ -627,10 +633,9 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
     return send_error(res, 502, "upstream_error", "无法连接模型服务");
   }
 
-  const std::string model_name = model.empty() ? config.model : model;
   res.set_header("X-Session-Id", turn.session_id);
 
-  if (!stream) {
+  if (!input.stream) {
     std::string answer;
     std::string error;
     std::string finish_reason = "stop";
@@ -675,7 +680,7 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
               json::array({{{"index", 0},
                             {"message", {{"role", "assistant"}, {"content", answer}}},
                             {"finish_reason", finish_reason}}})}};
-    if (prompt_tokens < 0) prompt_tokens = chat::estimate_tokens(user_text) + 8;
+    if (prompt_tokens < 0) prompt_tokens = turn.prompt_tokens_estimate;
     if (completion_tokens < 0) completion_tokens = chat::estimate_tokens(answer);
     out["usage"] = {{"prompt_tokens", prompt_tokens},
                     {"completion_tokens", completion_tokens},
@@ -714,8 +719,8 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
   state->request_id = trace_id;
   state->session_id = turn.session_id;
   state->user_id = principal.user_id;
-  state->prompt_tokens_estimate = estimate_request_tokens(user_text, config.max_tokens);
-  state->include_usage = true;
+  state->prompt_tokens_estimate = turn.prompt_tokens_estimate;
+  state->include_usage = input.include_usage;
   state->created = util::now_ms() / 1000;
   state->started = chat_started;
 

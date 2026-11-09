@@ -24,4 +24,11 @@ std::vector<llm::Message> build_context(const std::string& system_prompt,
                                         const std::string& user_text,
                                         const ContextBudget& budget);
 
+/// OpenAI `messages` 数组是权威上下文时使用：不再读服务端历史。
+/// 保留客户端给的 system（没有则用配置的 system prompt），从最新消息往前装，
+/// 超预算时丢弃更早的对话；最后一条必须是 user。
+std::vector<llm::Message> build_context_from_messages(
+    const std::string& system_prompt, const std::vector<llm::Message>& messages,
+    const ContextBudget& budget);
+
 }  // namespace chat

@@ -25,6 +25,18 @@ struct ChatRequest {
   double temperature = 0.7;
   int max_tokens = 0;      // 0 表示交给上游默认值
   bool include_usage = true;
+
+  // OpenAI 兼容的可选参数；用哨兵值表示「客户端没传」，避免覆盖上游默认值。
+  double top_p = -1.0;     // <0 表示不发送
+  std::vector<std::string> stop;
+  bool has_presence_penalty = false;
+  double presence_penalty = 0.0;
+  bool has_frequency_penalty = false;
+  double frequency_penalty = 0.0;
+  bool has_seed = false;
+  long long seed = 0;
+  std::string response_format;  // "" | "text" | "json_object"
+  std::string user;             // 可选的终端用户标识（透传上游）
 };
 
 enum class EventKind {

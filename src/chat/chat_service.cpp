@@ -184,21 +184,31 @@ ChatService::ChatService(llm::Provider& provider, SessionStore& store, ChatOptio
     : provider_(provider), store_(store), options_(std::move(options)), usage_(usage) {}
 
 ChatService::Turn ChatService::start(const auth::Principal& principal,
-                                     const std::string& session_id,
-                                     const std::string& user_text,
-                                     const std::string& model_override,
-                                     const std::string& request_id,
+                                     const StartOptions& options,
                                      quota::QuotaGuard quota_guard,
                                      std::shared_ptr<TurnObserver> observer) {
   if (!principal.is_admin && principal.user_id == 0) {
     throw Forbidden("需要登录后才能发起对话");
   }
 
+  std::string user_text = options.user_text;
+  if (user_text.empty() && !options.messages.empty()) {
+    for (auto it = options.messages.rbegin(); it != options.messages.rend(); ++it) {
+      if (it->role == "user") {
+        user_text = it->content;
+        break;
+      }
+    }
+  }
+  if (user_text.empty()) {
+    throw ContextTooLong("本轮消息不能为空");
+  }
+
   const std::string model =
-      model_override.empty() ? options_.default_model : model_override;
+      options.model_override.empty() ? options_.default_model : options.model_override;
   const std::string title = make_title(user_text);
 
-  std::string sid = session_id;
+  std::string sid = options.session_id;
   if (sid.empty()) {
     sid = store_.create(principal.user_id, title, model);
   } else if (!store_.exists(sid)) {
@@ -213,15 +223,35 @@ ChatService::Turn ChatService::start(const auth::Principal& principal,
 
   llm::ChatRequest request;
   request.model = model;
-  request.temperature = options_.temperature;
-  request.max_tokens = options_.max_tokens;
+  request.temperature =
+      options.temperature >= 0.0 ? options.temperature : options_.temperature;
+  request.max_tokens =
+      options.max_tokens > 0 ? options.max_tokens : options_.max_tokens;
+  request.top_p = options.top_p;
+  request.stop = options.stop;
+  request.has_presence_penalty = options.has_presence_penalty;
+  request.presence_penalty = options.presence_penalty;
+  request.has_frequency_penalty = options.has_frequency_penalty;
+  request.frequency_penalty = options.frequency_penalty;
+  request.has_seed = options.has_seed;
+  request.seed = options.seed;
+  request.response_format = options.response_format;
+  request.user = options.user;
+  request.include_usage = options.include_usage;
 
   ContextBudget budget;
   budget.max_context_tokens = options_.max_context_tokens;
-  budget.reserve_output_tokens = options_.max_tokens;
-  const std::vector<llm::Message> history =
-      store_.history(sid, options_.max_history_messages);
-  request.messages = build_context(options_.system_prompt, history, user_text, budget);
+  budget.reserve_output_tokens = request.max_tokens;
+  if (!options.messages.empty()) {
+    // OpenAI messages 数组是权威上下文：客户端每次都带完整历史，
+    // 不能再叠加服务端历史，否则会出现重复消息。
+    request.messages =
+        build_context_from_messages(options_.system_prompt, options.messages, budget);
+  } else {
+    const std::vector<llm::Message> history =
+        store_.history(sid, options_.max_history_messages);
+    request.messages = build_context(options_.system_prompt, history, user_text, budget);
+  }
 
   store_.append(sid, llm::Message{"user", user_text});
 
@@ -233,7 +263,7 @@ ChatService::Turn ChatService::start(const auth::Principal& principal,
   usage::UsageEvent usage_event;
   usage_event.user_id = principal.user_id;
   usage_event.session_id = sid;
-  usage_event.request_id = request_id;
+  usage_event.request_id = options.request_id;
   usage_event.model = model;
   usage_event.prompt_tokens = estimated_prompt_tokens;
 
@@ -242,7 +272,22 @@ ChatService::Turn ChatService::start(const auth::Principal& principal,
                                               std::move(usage_event), std::move(quota_guard),
                                               std::move(observer));
 
-  return Turn{sid, std::move(stream)};
+  return Turn{sid, std::move(stream), estimated_prompt_tokens};
+}
+
+ChatService::Turn ChatService::start(const auth::Principal& principal,
+                                     const std::string& session_id,
+                                     const std::string& user_text,
+                                     const std::string& model_override,
+                                     const std::string& request_id,
+                                     quota::QuotaGuard quota_guard,
+                                     std::shared_ptr<TurnObserver> observer) {
+  StartOptions options;
+  options.session_id = session_id;
+  options.user_text = user_text;
+  options.model_override = model_override;
+  options.request_id = request_id;
+  return start(principal, options, std::move(quota_guard), std::move(observer));
 }
 
 }  // namespace chat

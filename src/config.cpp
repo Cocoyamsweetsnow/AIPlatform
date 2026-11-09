@@ -86,6 +86,8 @@ Config Config::from_env() {
   c.api_keys = split_keys(env_str("AIP_API_KEYS", ""));
   if (c.api_keys.empty() && !c.api_key.empty()) c.api_keys.push_back(c.api_key);
   c.model = env_str("AIP_MODEL", c.model);
+  c.models = split_keys(env_str("AIP_MODELS", ""));
+  if (c.models.empty()) c.models.push_back(c.model);
   c.request_timeout_s = env_int("AIP_TIMEOUT_S", c.request_timeout_s);
   c.max_tokens = env_int("AIP_MAX_TOKENS", c.max_tokens);
   c.temperature = env_double("AIP_TEMPERATURE", c.temperature);
@@ -123,6 +125,10 @@ Config Config::from_env() {
   while (!c.base_url.empty() && c.base_url.back() == '/') c.base_url.pop_back();
 
   if (c.port <= 0 || c.port > 65535) throw std::runtime_error("AIP_PORT 超出范围");
+  if (c.models.size() > 64) throw std::runtime_error("AIP_MODELS 最多 64 个模型");
+  for (const auto& model : c.models) {
+    if (model.size() > 128) throw std::runtime_error("AIP_MODELS 中单个模型名不能超过 128 字节");
+  }
   if (c.log_format != "text" && c.log_format != "json") {
     throw std::runtime_error("AIP_LOG_FORMAT 只支持 text 或 json，当前值: " + c.log_format);
   }

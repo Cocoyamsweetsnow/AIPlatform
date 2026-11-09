@@ -9,9 +9,11 @@
 
 #include "auth/principal.h"
 #include "chat/chat_service.h"
+#include "chat/context_builder.h"
 #include "chat/session_store.h"
 #include "common/metrics.h"
 #include "config.h"
+#include "http/chat_request.h"
 #include "http/public_config.h"
 #include "http/request_context.h"
 #include "llm/event_queue.h"
@@ -340,6 +342,152 @@ void test_metrics_and_request_id() {
   platform::metrics::reset_for_tests();
 }
 
+
+void test_chat_request_parser() {
+  platform::Config config;
+  config.model = "demo-model";
+  config.models = {"demo-model"};
+  config.max_context_tokens = 8192;
+
+  nlohmann::json body{
+      {"model", "demo-model"},
+      {"temperature", 0.3},
+      {"max_tokens", 128},
+      {"top_p", 0.9},
+      {"stop", "STOP"},
+      {"stream_options", {{"include_usage", false}}},
+      {"messages",
+       nlohmann::json::array({{{"role", "system"}, {"content", "sys"}},
+                              {{"role", "user"}, {"content", "hi"}},
+                              {{"role", "assistant"}, {"content", "hello"}},
+                              {{"role", "user"}, {"content", "again"}}})}};
+
+  http::ChatParseError error;
+  auto parsed = http::parse_chat_request(body, config, error);
+  CHECK(parsed.has_value());
+  if (parsed.has_value()) {
+    CHECK(parsed->messages.size() == 4);
+    CHECK(parsed->user_text == "again");
+    CHECK(parsed->temperature == 0.3);
+    CHECK(parsed->max_tokens == 128);
+    CHECK(parsed->top_p == 0.9);
+    CHECK(parsed->stop.size() == 1);
+    CHECK(!parsed->include_usage);
+  }
+
+  chat::ContextBudget budget;
+  budget.max_context_tokens = 2048;
+  budget.reserve_output_tokens = 128;
+  const auto context = chat::build_context_from_messages("default", parsed->messages, budget);
+  CHECK(context.size() == 4);
+  CHECK(context.front().role == "system");
+  CHECK(context.front().content == "sys");
+  CHECK(context.back().role == "user");
+  CHECK(context.back().content == "again");
+
+  nlohmann::json bad_model{{"message", "hi"}, {"model", "other-model"}};
+  CHECK(!http::parse_chat_request(bad_model, config, error).has_value());
+  CHECK(error.type == "model_not_found");
+
+  nlohmann::json bad_last{{"messages",
+                           nlohmann::json::array({{{"role", "user"}, {"content", "hi"}},
+                                                  {{"role", "assistant"}, {"content", "yo"}}})}};
+  CHECK(!http::parse_chat_request(bad_last, config, error).has_value());
+  CHECK(error.type == "invalid_request");
+
+  nlohmann::json image{{"messages",
+                        nlohmann::json::array(
+                            {{{"role", "user"},
+                              {"content",
+                               nlohmann::json::array({{{"type", "image_url"},
+                                                       {"image_url", {{"url", "http://x"}}}}})}}})}};
+  CHECK(!http::parse_chat_request(image, config, error).has_value());
+  CHECK(error.type == "unsupported_content");
+
+  nlohmann::json too_many_tokens{{"message", "hi"}, {"max_tokens", 99999}};
+  CHECK(!http::parse_chat_request(too_many_tokens, config, error).has_value());
+  CHECK(error.type == "invalid_request");
+}
+
+class CapturingProvider final : public llm::Provider {
+ public:
+  llm::ChatRequest captured;
+  std::string name() const override { return "capturing"; }
+  std::unique_ptr<llm::Stream> chat_stream(const llm::ChatRequest& request) override {
+    captured = request;
+    class Stream final : public llm::Stream {
+     public:
+      llm::Pull next(llm::Event& out, std::chrono::milliseconds) override {
+        if (done_) return llm::Pull::End;
+        done_ = true;
+        out.kind = llm::EventKind::Delta;
+        out.text = "ok";
+        return llm::Pull::Event;
+      }
+      void cancel() override {}
+     private:
+      bool done_ = false;
+    };
+    return std::make_unique<Stream>();
+  }
+};
+
+void test_chat_service_full_messages() {
+  CapturingProvider provider;
+  chat::MemorySessionStore store(200, 100);
+  chat::ChatOptions options;
+  options.default_model = "mock-model";
+  options.system_prompt = "default system";
+  options.max_tokens = 128;
+  options.max_context_tokens = 2048;
+  chat::ChatService service(provider, store, options);
+
+  auth::Principal principal;
+  principal.is_admin = true;
+  principal.auth_type = "static";
+
+  chat::ChatService::StartOptions start;
+  start.user_text = "second";
+  start.messages = {{"system", "client system"},
+                    {"user", "first"},
+                    {"assistant", "answer"},
+                    {"user", "second"}};
+  start.temperature = 0.2;
+  start.max_tokens = 64;
+  start.top_p = 0.9;
+  start.stop = {"END"};
+  start.include_usage = false;
+  auto turn = service.start(principal, start);
+  CHECK(!turn.session_id.empty());
+  CHECK(turn.prompt_tokens_estimate > 0);
+
+  while (true) {
+    llm::Event event;
+    const llm::Pull pull = turn.stream->next(event, 5s);
+    if (pull == llm::Pull::End || pull == llm::Pull::Cancelled) break;
+    if (pull == llm::Pull::Timeout) continue;
+    if (event.kind == llm::EventKind::Done) break;
+    if (event.kind == llm::EventKind::Error) break;
+  }
+
+  CHECK(provider.captured.messages.size() == 4);
+  CHECK(provider.captured.messages.front().role == "system");
+  CHECK(provider.captured.messages.front().content == "client system");
+  CHECK(provider.captured.messages.back().content == "second");
+  CHECK(provider.captured.temperature == 0.2);
+  CHECK(provider.captured.max_tokens == 64);
+  CHECK(provider.captured.top_p == 0.9);
+  CHECK(provider.captured.stop.size() == 1);
+  CHECK(!provider.captured.include_usage);
+
+  const auto history = store.history(turn.session_id, 10);
+  // 客户端已带完整历史，服务端只落本轮 user + assistant，避免重复。
+  CHECK(history.size() == 2);
+  CHECK(history[0].role == "user");
+  CHECK(history[0].content == "second");
+  CHECK(history[1].role == "assistant");
+}
+
 }  // namespace
 
 int main() {
@@ -358,6 +506,8 @@ int main() {
   test_public_config_has_no_secrets();
   test_public_config_advertises_user_accounts();
   test_metrics_and_request_id();
+  test_chat_request_parser();
+  test_chat_service_full_messages();
 
   if (g_failures == 0) {
     std::printf("all tests passed\n");

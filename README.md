@@ -15,6 +15,8 @@
 - ✅ 内置 Web UI（零构建单页，编译进二进制）：流式对话、Markdown / 代码块、会话本地持久化、明暗主题、Token 设置
 - ✅ **Web 登录 / 注册**：邮箱密码注册登录、JWT access/refresh 自动刷新、退出登录；本地会话按账号隔离
 - ✅ SSE 流式输出，OpenAI 兼容的 chunk 格式（前端工具链可直接复用）
+- ✅ OpenAI 兼容扩展：完整 `messages` 上下文、`/v1/models`、请求级
+  `temperature/max_tokens/top_p/stop/seed/response_format/stream_options`
 - ✅ 模型网关：`Provider` 抽象 + OpenAI 兼容实现 + 离线 `mock` 实现
 - ✅ 上游 SSE 增量解析、非流式自动降级、上游错误映射
 - ✅ 上游失败重试（仅首 token 前；408/409/425/429/5xx + 连接类错误，指数退避 + 抖动）
@@ -270,12 +272,38 @@ AIP_WEB=false ./build/aiplatform
 }
 ```
 
+**OpenAI 兼容字段**（2026-11 扩展）：
+
+- 同时支持 `message`（本平台简化字段）和 OpenAI 原生 `messages` 数组。传 `messages`
+  时它被视为**权威上下文**，服务端不再叠加历史（适合 Open WebUI / LobeChat 这类每次带
+  全量历史的客户端）；服务端只落本轮 `user` 与最终 `assistant` 消息。
+- `messages` 支持 `system/user/assistant/tool` 文本消息；最后一条必须是 `user`。
+  图片/多模态 part 和 `tool_calls` 暂不支持，会返回明确的 `unsupported_content` /
+  `unsupported_tool`，而不是静默忽略。
+- 请求级参数：`temperature`（0~2）、`max_tokens`（1~`AIP_MAX_CONTEXT_TOKENS-64`）、
+  `top_p`（0~1）、`stop`（字符串或最多 4 项数组）、`presence_penalty` /
+  `frequency_penalty`（-2~2）、`seed`、`response_format`（`text` / `json_object`）、
+  `user`。未传时用服务端默认值。
+- `stream_options.include_usage=false` 时最后一个 chunk 不带 `usage`；服务端仍会按
+  估算值写用量流水。
+- `model` 必须是 `AIP_MODELS` 允许列表中的模型；默认只有 `AIP_MODEL`。
+
 响应：
 
 - `stream: true` → `text/event-stream`，每个 chunk 是 OpenAI 兼容的 `chat.completion.chunk`，
   结束时发送 `data: [DONE]`；上游出错时发送 `event: error` 再 `[DONE]`。
   在途流达到 `AIP_MAX_STREAMS` 时直接返回 503（`too_many_streams`），不会排队。
 - `stream: false` → 一个 `chat.completion` JSON，含 `usage`（在 WorkerPool 里跑，不占 IO 线程）。
+
+### 模型列表
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/v1/models` | OpenAI 兼容模型列表，返回 `{"object":"list","data":[...]}` |
+| GET | `/v1/models/{id}` | 单个模型信息；不在 `AIP_MODELS` 中返回 404 |
+
+`AIP_MODELS=deepseek-chat,deepseek-reasoner` 控制允许列表；默认只有 `AIP_MODEL`。
+对话请求里的 `model` 必须在允许列表中，否则返回 400 `model_not_found`。
 
 ### 会话管理
 

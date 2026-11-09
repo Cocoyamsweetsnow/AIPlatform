@@ -41,6 +41,7 @@
 #include "common/metrics.h"
 #include "common/structured_log.h"
 #include "http/auth_json.h"
+#include "http/chat_request.h"
 #include "http/public_config.h"
 #include "http/request_context.h"
 #include "http/session_json.h"
@@ -70,10 +71,6 @@ constexpr std::size_t kNonStreamQueueSize = 256;
 // 指到一个不存在的目录，让静态路由永远落到我们的 JSON 404 上。
 // （不要设成空串：StaticFileRouter 会对空路径取 realLocation_[len-1]，是未定义行为。）
 constexpr const char* kDisabledDocumentRoot = "/nonexistent-aiplatform-public";
-
-bool is_blank(const std::string& s) {
-  return s.find_first_not_of(" \t\r\n") == std::string::npos;
-}
 
 std::string json_error(const std::string& type, const std::string& message) {
   return json{{"error", {{"type", type}, {"message", message}}}}.dump();
@@ -156,6 +153,33 @@ HttpResponsePtr quota_error(const quota::QuotaDecision& decision) {
 
 int estimate_request_tokens(const std::string& text, int max_tokens) {
   return chat::estimate_tokens(text) + std::max(0, max_tokens) + 8;
+}
+
+int effective_max_tokens(const http::ChatRequestInput& input, int fallback) {
+  return input.max_tokens > 0 ? input.max_tokens : fallback;
+}
+
+chat::ChatService::StartOptions to_start_options(const http::ChatRequestInput& input) {
+  chat::ChatService::StartOptions options;
+  options.session_id = input.session_id;
+  options.user_text = input.user_text;
+  options.messages = input.messages;
+  options.model_override = input.model;
+  options.request_id = input.request_id;
+  options.temperature = input.temperature;
+  options.max_tokens = input.max_tokens;
+  options.top_p = input.top_p;
+  options.stop = input.stop;
+  options.has_presence_penalty = input.has_presence_penalty;
+  options.presence_penalty = input.presence_penalty;
+  options.has_frequency_penalty = input.has_frequency_penalty;
+  options.frequency_penalty = input.frequency_penalty;
+  options.has_seed = input.has_seed;
+  options.seed = input.seed;
+  options.response_format = input.response_format;
+  options.user = input.user;
+  options.include_usage = input.include_usage;
+  return options;
 }
 
 HttpResponsePtr idempotency_busy_response() {
@@ -594,10 +618,10 @@ struct ApiServer::Impl {
                    drogon::AdviceChainCallback&& chain);
   auth::Principal principal_from(const HttpRequestPtr& req) const;
   void handle_chat(const HttpRequestPtr& req, ResponseCallback&& callback);
-  void handle_non_stream(const auth::Principal& principal, const std::string& session_id,
-                         const std::string& user_text, const std::string& model,
-                         const std::string& model_name, const std::string& request_id,
-                         const std::string& trace_id,
+  void handle_models(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_non_stream(const auth::Principal& principal,
+                         const http::ChatRequestInput& input,
+                         const std::string& model_name, const std::string& trace_id,
                          const std::shared_ptr<ResponseCallback>& callback);
   void handle_history(const HttpRequestPtr& req, ResponseCallback&& callback);
   void handle_sessions_list(const HttpRequestPtr& req, ResponseCallback&& callback);
@@ -793,6 +817,20 @@ void ApiServer::Impl::setup() {
       R"(/(?:index\.html|favicon\.svg|assets/[A-Za-z0-9._\-]+))",
       [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
         handle_static(req, std::move(callback));
+      },
+      {drogon::Get});
+
+  drogon::app().registerHandler(
+      "/v1/models",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_models(req, std::move(callback));
+      },
+      {drogon::Get});
+
+  drogon::app().registerHandlerViaRegex(
+      R"(/v1/models/([A-Za-z0-9._:\-]+))",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_models(req, std::move(callback));
       },
       {drogon::Get});
 
@@ -1053,6 +1091,45 @@ HttpResponsePtr ApiServer::Impl::make_sse_response(
   return resp;
 }
 
+void ApiServer::Impl::handle_models(const HttpRequestPtr& req, ResponseCallback&& callback) {
+  static constexpr std::string_view kPrefix = "/v1/models/";
+  std::string requested;
+  if (req->path().size() > kPrefix.size() &&
+      req->path().compare(0, kPrefix.size(), kPrefix) == 0) {
+    requested = req->path().substr(kPrefix.size());
+  }
+
+  auto find_model = [this](const std::string& id) -> const std::string* {
+    for (const auto& model : config.models) {
+      if (model == id) return &model;
+    }
+    return nullptr;
+  };
+
+  if (!requested.empty()) {
+    const std::string* model = find_model(requested);
+    if (model == nullptr) {
+      callback(error_response(drogon::k404NotFound, "model_not_found",
+                              "模型不存在: " + requested));
+      return;
+    }
+    callback(json_ok(json{{"id", *model},
+                          {"object", "model"},
+                          {"created", 0},
+                          {"owned_by", "aiplatform"}}));
+    return;
+  }
+
+  json data = json::array();
+  for (const auto& model : config.models) {
+    data.push_back(json{{"id", model},
+                        {"object", "model"},
+                        {"created", 0},
+                        {"owned_by", "aiplatform"}});
+  }
+  callback(json_ok(json{{"object", "list"}, {"data", data}}));
+}
+
 void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& callback) {
   json body;
   try {
@@ -1061,92 +1138,27 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
     callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体不是合法 JSON"));
     return;
   }
-  if (!body.is_object()) {
-    callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体必须是 JSON 对象"));
+
+  http::ChatParseError parse_error;
+  auto parsed = http::parse_chat_request(body, config, parse_error);
+  if (!parsed.has_value()) {
+    const auto status = static_cast<drogon::HttpStatusCode>(parse_error.status);
+    callback(error_response(status, parse_error.type, parse_error.message));
     return;
   }
-
-  std::string user_text;
-  if (body.contains("message") && body["message"].is_string()) {
-    user_text = body["message"].get<std::string>();
-  } else if (body.contains("messages") && body["messages"].is_array()) {
-    // 兼容 OpenAI 原生格式：取最后一条 user 作为本轮输入。
-    for (const auto& message : body["messages"]) {
-      if (message.is_object() && message.value("role", "") == "user" &&
-          message.contains("content") && message["content"].is_string()) {
-        user_text = message["content"].get<std::string>();
-      }
-    }
-  }
-  if (is_blank(user_text)) {
-    callback(error_response(drogon::k400BadRequest, "invalid_request",
-                            "缺少 message 字段（或 messages 中最后一条 user 消息为空）"));
-    return;
-  }
-  if (user_text.size() > kMaxMessageBytes) {
-    callback(error_response(drogon::k413RequestEntityTooLarge, "payload_too_large",
-                            "单条消息超过 32KB 限制"));
-    return;
-  }
-
-  // 逐字段校验类型：body.value() 在字段类型不对时会抛 type_error（→ 500），
-  // 客户端传错类型应该得到 400 而不是内部错误。
-  std::string session_id;
-  if (body.contains("session_id")) {
-    if (!body["session_id"].is_string()) {
-      callback(error_response(drogon::k400BadRequest, "invalid_request",
-                              "session_id 必须是字符串"));
-      return;
-    }
-    session_id = body["session_id"].get<std::string>();
-  }
-  std::string model;
-  if (body.contains("model")) {
-    if (!body["model"].is_string()) {
-      callback(error_response(drogon::k400BadRequest, "invalid_request", "model 必须是字符串"));
-      return;
-    }
-    model = body["model"].get<std::string>();
-  }
-  bool stream = true;
-  if (body.contains("stream")) {
-    if (!body["stream"].is_boolean()) {
-      callback(error_response(drogon::k400BadRequest, "invalid_request",
-                              "stream 必须是布尔值"));
-      return;
-    }
-    stream = body["stream"].get<bool>();
-  }
-
-  std::string request_id;
-  if (body.contains("request_id")) {
-    if (!body["request_id"].is_string()) {
-      callback(error_response(drogon::k400BadRequest, "invalid_request",
-                              "request_id 必须是字符串"));
-      return;
-    }
-    request_id = body["request_id"].get<std::string>();
-    if (request_id.empty() || request_id.size() > 128) {
-      callback(error_response(drogon::k400BadRequest, "invalid_request",
-                              "request_id 长度应在 1~128"));
-      return;
-    }
-  }
-
-  const std::string model_name = model.empty() ? config.model : model;
+  const http::ChatRequestInput& input = *parsed;
+  const std::string model_name = input.model.empty() ? config.model : input.model;
   const auth::Principal principal = principal_from(req);
   std::string trace_id;
   if (const auto& attrs = req->attributes(); attrs && attrs->find("request_id")) {
     trace_id = attrs->get<std::string>("request_id");
   }
 
-  if (!stream) {
+  if (!input.stream) {
     auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
     const bool queued = workers.submit(
-        [this, principal, session_id, user_text, model, model_name, request_id, trace_id,
-         shared_callback] {
-          handle_non_stream(principal, session_id, user_text, model, model_name, request_id,
-                            trace_id, shared_callback);
+        [this, principal, input, model_name, trace_id, shared_callback] {
+          handle_non_stream(principal, input, model_name, trace_id, shared_callback);
         });
     if (!queued) {
       (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
@@ -1166,10 +1178,10 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
 
   // 会话读写放到独立线程池：Drogon 的 IO 线程只做 epoll/send，不在这里等 PostgreSQL。
   const bool queued = db_workers.submit(
-      [this, principal, session_id, user_text, model, model_name, request_id, trace_id, slot,
-       shared_callback] {
+      [this, principal, input, model_name, trace_id, slot, shared_callback] {
         chat::ChatService::Turn turn;
         const std::string scope = principal.scope();
+        const std::string& request_id = input.request_id;
         auto mark_failed = [this, &scope, &request_id](const std::string& type,
                                                        const std::string& message) {
           if (request_id.empty() || idempotency_ == nullptr) return;
@@ -1218,8 +1230,12 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
           quota::QuotaGuard guard;
           if (quota_ != nullptr) {
             auto acquired = quota_->try_acquire(
-                principal, estimate_request_tokens(user_text, config.max_tokens), daily_used);
+                principal,
+                estimate_request_tokens(input.user_text,
+                                        effective_max_tokens(input, config.max_tokens)),
+                daily_used);
             if (!acquired.decision.allowed) {
+              metrics::inc_quota_rejection(acquired.decision.type);
               mark_failed("rate_limited", acquired.decision.message);
               post(shared_callback, quota_error(acquired.decision));
               return;
@@ -1232,8 +1248,8 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
             observer = std::make_shared<chat::IdempotencyObserver>(*idempotency_, scope,
                                                                   request_id);
           }
-          turn = service.start(principal, session_id, user_text, model, request_id,
-                               std::move(guard), observer);
+          turn = service.start(principal, to_start_options(input), std::move(guard),
+                               observer);
         } catch (const chat::ContextTooLong& e) {
           mark_failed("context_too_long", e.what());
           post(shared_callback,
@@ -1267,12 +1283,11 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
         if (loop == nullptr) return;  // 退出中：turn/slot 析构会取消上游并释放名额
         loop->queueInLoop(
             [this, turn = std::move(turn), model_name, trace_id, principal, slot,
-             user_text, shared_callback]() mutable {
+             include_usage = input.include_usage, shared_callback]() mutable {
               auto resp = make_sse_response(
                   std::move(turn.stream), util::random_id("chatcmpl-"), model_name,
                   std::move(slot), trace_id, principal.user_id, turn.session_id,
-                  estimate_request_tokens(user_text, config.max_tokens),
-                  /*include_usage=*/true);
+                  turn.prompt_tokens_estimate, include_usage);
               resp->addHeader("X-Session-Id", turn.session_id);
               (*shared_callback)(resp);
             });
@@ -1286,15 +1301,14 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
 }
 
 void ApiServer::Impl::handle_non_stream(const auth::Principal& principal,
-                                        const std::string& session_id,
-                                        const std::string& user_text, const std::string& model,
+                                        const http::ChatRequestInput& input,
                                         const std::string& model_name,
-                                        const std::string& request_id,
                                         const std::string& trace_id,
                                         const std::shared_ptr<ResponseCallback>& callback) {
   const auto started = std::chrono::steady_clock::now();
   chat::ChatService::Turn turn;
   const std::string scope = principal.scope();
+  const std::string& request_id = input.request_id;
   auto mark_failed = [this, &scope, &request_id](const std::string& type,
                                                  const std::string& message) {
     if (request_id.empty() || idempotency_ == nullptr) return;
@@ -1341,8 +1355,12 @@ void ApiServer::Impl::handle_non_stream(const auth::Principal& principal,
     quota::QuotaGuard guard;
     if (quota_ != nullptr) {
       auto acquired = quota_->try_acquire(
-          principal, estimate_request_tokens(user_text, config.max_tokens), daily_used);
+          principal,
+          estimate_request_tokens(input.user_text,
+                                  effective_max_tokens(input, config.max_tokens)),
+          daily_used);
       if (!acquired.decision.allowed) {
+        metrics::inc_quota_rejection(acquired.decision.type);
         mark_failed("rate_limited", acquired.decision.message);
         post(callback, quota_error(acquired.decision));
         return;
@@ -1354,8 +1372,7 @@ void ApiServer::Impl::handle_non_stream(const auth::Principal& principal,
     if (!request_id.empty() && idempotency_ != nullptr) {
       observer = std::make_shared<chat::IdempotencyObserver>(*idempotency_, scope, request_id);
     }
-    turn = service.start(principal, session_id, user_text, model, request_id,
-                         std::move(guard), observer);
+    turn = service.start(principal, to_start_options(input), std::move(guard), observer);
   } catch (const chat::ContextTooLong& e) {
     mark_failed("context_too_long", e.what());
     post(callback, error_response(drogon::k413RequestEntityTooLarge, "context_too_long", e.what()));
@@ -1434,7 +1451,7 @@ void ApiServer::Impl::handle_non_stream(const auth::Principal& principal,
   }
 
   if (prompt_tokens < 0) {
-    prompt_tokens = chat::estimate_tokens(user_text) + 8;
+    prompt_tokens = turn.prompt_tokens_estimate;
   }
   if (completion_tokens < 0) {
     completion_tokens = chat::estimate_tokens(answer);

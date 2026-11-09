@@ -29,6 +29,7 @@ inline std::string public_config_json(const platform::Config& config, const char
       {"http", http_backend},
       {"provider", config.provider},
       {"model", config.model},
+      {"models", config.models},
       {"storage", config.storage},
       {"auth_required", config.auth_enabled()},
       {"auth",

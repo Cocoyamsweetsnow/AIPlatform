@@ -24,6 +24,7 @@ struct Config {
   std::string api_key;                 // AIP_API_KEY（单 key，兼容旧配置）
   std::vector<std::string> api_keys;   // AIP_API_KEYS（逗号分隔，非空时优先）
   std::string model{"deepseek-chat"};
+  std::vector<std::string> models;  // AIP_MODELS；为空表示只暴露/允许 AIP_MODEL
   int request_timeout_s{120};
   int max_tokens{1024};
   double temperature{0.7};

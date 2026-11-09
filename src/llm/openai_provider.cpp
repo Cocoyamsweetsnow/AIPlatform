@@ -47,6 +47,15 @@ std::string build_payload(const ChatRequest& req, const OpenAiOptions& opts) {
   body["stream"] = true;
   body["temperature"] = req.temperature;
   if (req.max_tokens > 0) body["max_tokens"] = req.max_tokens;
+  if (req.top_p >= 0.0) body["top_p"] = req.top_p;
+  if (!req.stop.empty()) body["stop"] = req.stop;
+  if (req.has_presence_penalty) body["presence_penalty"] = req.presence_penalty;
+  if (req.has_frequency_penalty) body["frequency_penalty"] = req.frequency_penalty;
+  if (req.has_seed) body["seed"] = req.seed;
+  if (!req.response_format.empty()) {
+    body["response_format"] = {{"type", req.response_format}};
+  }
+  if (!req.user.empty()) body["user"] = req.user;
   // 让上游在最后一个 chunk 里返回 usage，用于计费；个别兼容实现不支持时可关掉。
   if (req.include_usage) body["stream_options"] = {{"include_usage", true}};
   return body.dump();
