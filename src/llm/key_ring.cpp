@@ -101,8 +101,11 @@ bool KeyRing::record_failure(std::size_t index, int http_status, bool retryable)
   ++state.consecutive_failures;
   const int threshold = std::max(1, config_.failure_threshold);
 
-  // 429 立即冷却（不必等连续失败到阈值），避免重试风暴继续打同一个 Key。
-  if (rate_limited) state.consecutive_failures = std::max(state.consecutive_failures, threshold);
+  // 多 Key 时 429 立即冷却该 Key，重试会换到下一个 Key；
+  // 单 Key 时仍按失败阈值重试，否则一次 429 就把唯一通道彻底关死。
+  if (rate_limited && keys_.size() > 1) {
+    state.consecutive_failures = std::max(state.consecutive_failures, threshold);
+  }
   if (key_level_auth) state.consecutive_failures = std::max(state.consecutive_failures, threshold);
 
   if (state.consecutive_failures < threshold) return false;

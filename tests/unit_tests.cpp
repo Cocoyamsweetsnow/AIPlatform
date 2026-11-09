@@ -277,14 +277,24 @@ void test_key_ring_round_robin() {
   CHECK(next.has_value() && next->index == 0);  // 跳过冷却中的 b
 
   llm::KeyRingConfig rate;
-  rate.failure_threshold = 3;
+  rate.failure_threshold = 1;
   rate.cooldown_s = 1;
   rate.cooldown_max_s = 1;
   llm::KeyRing ratelimited({"x"}, rate);
   auto x = ratelimited.acquire();
   CHECK(x.has_value());
-  CHECK(ratelimited.record_failure(x->index, 429, /*retryable=*/true));  // 429 立即冷却
+  CHECK(ratelimited.record_failure(x->index, 429, /*retryable=*/true));  // 阈值 1 -> 冷却
   CHECK(!ratelimited.acquire().has_value());
+
+  llm::KeyRingConfig multi_rate;
+  multi_rate.failure_threshold = 3;
+  multi_rate.cooldown_s = 1;
+  multi_rate.cooldown_max_s = 1;
+  llm::KeyRing multi({"x", "y"}, multi_rate);
+  auto mx = multi.acquire();
+  CHECK(mx.has_value());
+  CHECK(multi.record_failure(mx->index, 429, /*retryable=*/true));  // 多 Key 429 立即冷却
+  CHECK(multi.acquire().has_value());  // 另一个 Key 仍可用
 }
 
 void test_config_parses_api_keys() {
