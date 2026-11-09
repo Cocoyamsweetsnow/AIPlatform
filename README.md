@@ -169,8 +169,8 @@ export AIP_MAX_CONCURRENT_PER_USER=4       # 每用户并发流，0 = 不限
   advisory lock + 预留避免先查后写超卖；并发流用带 TTL 的 lease，进程崩溃自动回收。
 - memory 模式仍是进程内限流，只适合单实例/演示。
 - 每日 token 的 usage 流水是异步写的：流结束到流水落库之间有短暂延迟，
-  极端并发下可能多放行少量请求；要求严格账实一致时，把 `AIP_USAGE_ASYNC=false`
-  （预留）或改用同步写入（见 ADR 0008）。
+  极端并发下可能多放行少量请求；要求严格账实一致时设置 `AIP_USAGE_ASYNC=false`
+  改用同步写入（见 ADR 0008）。
 - 静态管理员和未绑定用户的请求不受限；普通 JWT/API Key 用户按上面的配置限流。
 
 ### 上下文预算
