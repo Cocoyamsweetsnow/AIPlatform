@@ -35,6 +35,11 @@
 3. **一次把话说清楚**：需要人提供信息时，列出所需字段，不来回猜。
 4. **先给选项再给推荐**：涉及成本/架构的选择，给 2~3 个选项 + 权衡 + 建议，由人拍板。
 5. **小步交付**：每次改动尽量小、可单独验证、可回滚。
+6. **启动配置同步**：只要新增/重命名环境变量、改变启动前置条件（例如“JWT 必须配
+   PostgreSQL”“Cookie 模式必须配 Public URL”），就必须同步
+   `config/config.example.env`、`scripts/run.sh`、`docker-compose.yml`（涉及容器时）和
+   `README.md` / `docs/BUILD.md`；提交前至少跑一次 `./scripts/run.sh --help` 和
+   `./scripts/run.sh --memory --mock`。详细清单见 [docs/BUILD.md](docs/BUILD.md) 第 2.11 节。
 
 ## 允许 AI 直接做的（低成本、只读或纯文本）
 

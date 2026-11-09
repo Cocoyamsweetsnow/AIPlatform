@@ -112,13 +112,25 @@ C++ raw string 编进二进制。改完 `web/` 重新 `cmake --build build -j2` 
 ### 2.0 一键启动（推荐）
 
 ```bash
-./scripts/run.sh              # 加载 .env，自动拉起 PostgreSQL，真实模型 + 持久化
-./scripts/run.sh --memory     # 不连数据库，会话重启即丢
-./scripts/run.sh --port 8081  # 换端口
+./scripts/run.sh                         # 加载 .env，自动拉起 PostgreSQL，真实模型 + 持久化
+./scripts/run.sh --mock                  # 强制 mock，不消耗 API Key
+./scripts/run.sh --memory               # 不连数据库；自动关闭 JWT/账号体系
+./scripts/run.sh --mock --port 8081     # 离线 + 换端口
+./scripts/run.sh --binary build-drogon/aiplatform   # Drogon 主线二进制
 ```
 
-脚本只做三件事：加载 `.env`、确保 compose 里的 PostgreSQL 就绪、`exec ./build/aiplatform`。
-它不会停止数据库、不会删数据卷；`Ctrl-C` 停止应用。8080 被占用时会提示原因和处理方式。
+脚本负责：加载 `.env`、确保 compose 里的 PostgreSQL 就绪、做 P0 配置的启动前校验、
+`exec` 目标二进制。它不会停止数据库、不会删数据卷；`Ctrl-C` 停止应用。
+8080 被占用时会提示原因和处理方式。
+
+- 默认二进制是 `build/aiplatform`；Drogon 主线用 `--binary build-drogon/aiplatform`
+  或设置 `AIP_BINARY`。
+- `--memory` 会临时忽略 `AIP_JWT_SECRET` / `AIP_AUTH_REQUIRED` /
+  `AIP_EMAIL_VERIFICATION_REQUIRED` / `AIP_AUTH_COOKIE_MODE`，因为用户体系依赖 PostgreSQL。
+- `AIP_AUTH_COOKIE_MODE=1` 且未设置 `AIP_PUBLIC_BASE_URL` 时，脚本按当前端口补
+  `http://127.0.0.1:<port>`；生产请显式设置同源 HTTPS 地址。
+- `AIP_AUTH_REQUIRED=1` 但既无 JWT secret 也无静态 Token 时，脚本直接报错。
+
 需要手动控制每一项配置时，再按 2.1~2.7 的原始命令运行。
 
 ### 2.1 离线模式（mock 模型，不需要 API Key）
@@ -149,9 +161,10 @@ AIP_DB_DSN='postgresql://aiplatform:aiplatform@127.0.0.1:55432/aiplatform?connec
 ./build/aiplatform
 ```
 
-启动日志应出现 `storage: postgres` 和 `应用数据库迁移 v1`。迁移会自动建表
-（`users / api_keys / sessions / messages / usage_records / request_dedup`）；
-迁移可重复执行，多实例并发启动用 advisory lock 串行化。
+启动日志应出现 `storage: postgres` 和数据库迁移日志（v1~v3）。迁移会自动建表
+（`users / api_keys / sessions / messages / usage_records / request_dedup /
+refresh_tokens / one_time_tokens / rate_limits / quota_reservations /
+quota_stream_leases`）；迁移可重复执行，多实例并发启动用 advisory lock 串行化。
 
 验证持久化：
 
@@ -292,6 +305,23 @@ kill -TERM %1
 若在途流超过 `AIP_SHUTDOWN_DRAIN_S`（默认 30s），会打印「退出超时」并强制关闭。
 
 ---
+
+### 2.11 启动配置变更检查清单
+
+每次新增/重命名环境变量、改变启动前置条件（例如“JWT 必须配 PostgreSQL”）时，
+按顺序同步下列位置，并在合并前跑一次 `./scripts/run.sh --help` 和
+`./scripts/run.sh --memory --mock`：
+
+1. `src/config.h` / `src/config.cpp`：字段、默认值、校验；
+2. `config/config.example.env`：给用户的配置模板与注释；
+3. `scripts/run.sh`：默认值、互斥校验、启动提示（本次 P0 已加
+   `--mock` / `--binary`、memory 模式关闭 JWT、Cookie 模式 Public URL 校验）；
+4. `docker-compose.yml` / `Dockerfile`：容器内需要的环境变量或健康检查；
+5. `README.md` / `docs/BUILD.md` / ADR：运行命令与行为变化；
+6. 单测/冒烟：至少覆盖默认值、必填校验和一种“错误配置应拒绝启动”的路径。
+
+判断标准：**新人按 README 的命令、用仓库里的 example env，能一次启动成功；
+旧 `.env` 升级后不会因为新增前置条件而静默启动失败。**
 
 ## 3. Docker 镜像构建
 

@@ -51,21 +51,42 @@
 ```bash
 # 依赖：CMake ≥ 3.20、支持 C++20 的编译器、libcurl 开发包、Drogon ≥ 1.9.14
 # Ubuntu: sudo apt install build-essential cmake pkg-config libcurl4-openssl-dev
-# Drogon 需源码编译（约 7~10 分钟），步骤见 docs/BUILD.md 第 1.1 节；
-# 没有 Drogon 的机器可以先用回退后端：
-#   cmake -S . -B build -DAIPLATFORM_HTTP=httplib
+# Drogon 需源码编译（约 7~10 分钟），步骤见 docs/BUILD.md 第 1.1 节。
 
-cmake -S . -B build -DAIPLATFORM_BUILD_TESTS=ON
+# 主线：Drogon
+cmake -S . -B build-drogon -DAIPLATFORM_BUILD_TESTS=ON
+cmake --build build-drogon -j2
+ctest --test-dir build-drogon --output-on-failure
+./scripts/run.sh --binary build-drogon/aiplatform
+
+# 没有 Drogon 的机器：httplib 回退后端，API 契约一致
+cmake -S . -B build -DAIPLATFORM_HTTP=httplib -DAIPLATFORM_BUILD_TESTS=ON
 cmake --build build -j2
 ctest --test-dir build --output-on-failure
+./scripts/run.sh
 
-# 离线模式（mock 模型，不需要 API key），默认监听 :8080
-./build/aiplatform
+# 完全离线（mock 模型 + 内存存储，不读 API key、不连 PostgreSQL）
+./scripts/run.sh --mock --memory
 
-# 想用 .env 里的真实模型 + PostgreSQL（自动拉起 compose 里的 postgres）：
-#   ./scripts/run.sh
-# 只想要内存模式：./scripts/run.sh --memory
+# 换端口 / 用 .env 里的真实模型 + PostgreSQL（自动拉起 compose 里的 postgres）
+./scripts/run.sh --mock --port 8081
+./scripts/run.sh
 ```
+
+启动后建议依次确认：
+
+```bash
+curl -sS http://127.0.0.1:8080/healthz
+curl -sS http://127.0.0.1:8080/readyz
+curl -sS http://127.0.0.1:8080/v1/config
+curl -sS http://127.0.0.1:8080/v1/models
+curl -sS http://127.0.0.1:8080/metrics | head
+```
+
+> **配置变更约定**：新增/重命名环境变量时，必须同步
+> [config/config.example.env](config/config.example.env)、[scripts/run.sh](scripts/run.sh)、
+> [docker-compose.yml](docker-compose.yml)（如部署相关）和 README/BUILD，避免“代码能跑、
+> 启动脚本还是旧配置”。
 
 需要持久化时（会话/消息落 PostgreSQL，重启不丢）：
 
