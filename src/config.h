@@ -17,6 +17,7 @@ struct Config {
   bool metrics_enabled{true};      // AIP_METRICS_ENABLED
   std::string metrics_token;       // 非空时 /metrics 需要 Bearer Token
   bool trust_proxy{false};         // 信任 X-Forwarded-For（部署在 Nginx 后时开启）
+  bool usage_async{true};          // usage 流水异步写；false = 流结束时同步写
 
   // 上游模型
   std::string provider{"mock"};  // mock | openai
@@ -74,6 +75,7 @@ struct Config {
   int rpm_limit{60};                  // 每用户每分钟请求数
   int daily_token_limit{1000000};     // 每用户每日 token
   int max_concurrent_per_user{4};     // 每用户并发流
+  int quota_lease_s{900};             // PG 配额预留/并发 lease TTL
   int idempotency_ttl_s{180};         // in_progress 超过该时间视为崩溃，可重试
 
   // HTTP 层（Drogon 后端；httplib 回退实现只用 heartbeat_s）

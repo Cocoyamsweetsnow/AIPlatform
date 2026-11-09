@@ -30,6 +30,7 @@
 - ✅ 账号安全：refresh 轮换与吊销、改密踢下线、邮箱验证、找回密码、登录/注册限流、恒定时间假哈希
 - ✅ 多租户会话归属：普通用户只能访问自己的会话；admin 可访问全部
 - ✅ 配额限流：每用户 RPM / 并发流 / 每日 token；超出返回 429 + `Retry-After`
+- ✅ 多副本配额（PostgreSQL 原子预留/lease）、usage 异步可靠写
 - ✅ 用量流水：`usage_records` 记录 prompt/completion tokens、TTFT、latency
 - ✅ 请求幂等：`request_id` 重放非流式/流式结果，`in_progress` 409，崩溃 TTL 自动恢复
 - ✅ 会话管理：列表/改名/软删除；历史支持 `limit`，跨用户 404
@@ -163,7 +164,13 @@ export AIP_MAX_CONCURRENT_PER_USER=4       # 每用户并发流，0 = 不限
 - 超限返回 `429`，带 `Retry-After` 秒数；每日配额用 `type=quota_exceeded`。
 - 每次完成/取消的请求写 `usage_records`：`user_id/session_id/model/prompt_tokens/
   completion_tokens/latency_ms/ttft_ms`。
-- 当前限流是**进程内**的，单实例精确；多副本部署前必须切 Redis 或网关限流。
+- `AIP_STORAGE=postgres` 时配额走 **PostgreSQL 原子预留**（`quota_reservations` /
+  `quota_stream_leases`）：RPM 用 `rate_limits` 固定窗口、多副本共享；每日 token 用
+  advisory lock + 预留避免先查后写超卖；并发流用带 TTL 的 lease，进程崩溃自动回收。
+- memory 模式仍是进程内限流，只适合单实例/演示。
+- 每日 token 的 usage 流水是异步写的：流结束到流水落库之间有短暂延迟，
+  极端并发下可能多放行少量请求；要求严格账实一致时，把 `AIP_USAGE_ASYNC=false`
+  （预留）或改用同步写入（见 ADR 0008）。
 - 静态管理员和未绑定用户的请求不受限；普通 JWT/API Key 用户按上面的配置限流。
 
 ### 上下文预算
@@ -563,6 +570,7 @@ RAG/工具调用/本地推理。
 | [docs/adr/0005-idempotency-sessions.md](docs/adr/0005-idempotency-sessions.md) | 请求幂等与会话管理 API |
 | [docs/adr/0006-context-budget.md](docs/adr/0006-context-budget.md) | token 预算上下文裁剪 |
 | [docs/adr/0007-account-security.md](docs/adr/0007-account-security.md) | refresh 轮换/吊销、邮箱验证、找回密码、登录限流 |
+| [docs/adr/0008-distributed-quota.md](docs/adr/0008-distributed-quota.md) | 多副本配额原子预留与 usage 异步写 |
 | [docs/BUILD.md](docs/BUILD.md) | 编译、运行、镜像构建、排错手册 |
 | [docs/GIT.md](docs/GIT.md) | Git 工作流、提交规范、发布与事故处理 |
 

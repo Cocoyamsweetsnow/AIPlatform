@@ -7,6 +7,7 @@
 
 #include "chat/pg_idempotency_store.h"
 #include "chat/pg_session_store.h"
+#include "quota/pg_quota.h"
 #include "storage/db.h"
 #include "storage/migrations.h"
 #include "usage/pg_usage_sink.h"
@@ -61,7 +62,8 @@ int main() {
 
     pool.exec(
         "TRUNCATE users, api_keys, sessions, messages, usage_records, request_dedup,"
-        " refresh_tokens, one_time_tokens, rate_limits "
+        " refresh_tokens, one_time_tokens, rate_limits, quota_reservations,"
+        " quota_stream_leases "
         "RESTART IDENTITY CASCADE");
 
     const std::int64_t alice = make_user(pool, "alice@example.com");
@@ -251,9 +253,72 @@ int main() {
     CHECK(dedup.claim("u:stale", "req-stale").status == chat::DedupStatus::Claimed);
     dedup.remove("u:stale", "req-stale");
 
+    // 多副本配额：每日 token 原子预留 + 并发 lease。
+    auth::Principal alice_principal;
+    alice_principal.user_id = alice;
+    quota::QuotaConfig daily_config;
+    daily_config.rpm_limit = 0;
+    daily_config.daily_token_limit = 100;
+    daily_config.max_concurrent = 0;
+    quota::PgQuotaService daily_quota(pool, daily_config, 300);
+    CHECK(!daily_quota.requires_daily_usage());
+
+    auto daily_first = daily_quota.try_acquire(alice_principal, 60, 0);
+    CHECK(daily_first.decision.allowed);
+    // 60 + 50 > 100，第二笔必须被原子预留拦住。
+    auto over_daily = daily_quota.try_acquire(alice_principal, 50, 0);
+    CHECK(!over_daily.decision.allowed);
+    CHECK(over_daily.decision.type == "quota_exceeded");
+    daily_first.guard.release();
+
+    auto daily_second = daily_quota.try_acquire(alice_principal, 50, 0);
+    CHECK(daily_second.decision.allowed);
+    daily_second.guard.release();
+
+    const auto reservations = pool.exec(
+        "SELECT count(*) FROM quota_reservations WHERE user_id = $1",
+        {std::to_string(alice)});
+    const auto leases = pool.exec(
+        "SELECT count(*) FROM quota_stream_leases WHERE user_id = $1",
+        {std::to_string(alice)});
+    CHECK(reservations.int64(0, 0) == 0);
+    CHECK(leases.int64(0, 0) == 0);
+
+    // 并发 lease：第二个在途请求被拒，释放后可再次进入。
+    quota::QuotaConfig concurrent_config;
+    concurrent_config.rpm_limit = 0;
+    concurrent_config.daily_token_limit = 0;
+    concurrent_config.max_concurrent = 1;
+    quota::PgQuotaService concurrent_quota(pool, concurrent_config, 300);
+    auto concurrent_first = concurrent_quota.try_acquire(alice_principal, 10, 0);
+    CHECK(concurrent_first.decision.allowed);
+    auto concurrent_second = concurrent_quota.try_acquire(alice_principal, 10, 0);
+    CHECK(!concurrent_second.decision.allowed);
+    CHECK(concurrent_second.decision.type == "rate_limited");
+    concurrent_first.guard.release();
+    auto concurrent_third = concurrent_quota.try_acquire(alice_principal, 10, 0);
+    CHECK(concurrent_third.decision.allowed);
+    concurrent_third.guard.release();
+
+    // RPM 固定窗口：两个请求后第三个 429。
+    auth::Principal bob_principal;
+    bob_principal.user_id = bob;
+    quota::QuotaConfig rpm_config;
+    rpm_config.rpm_limit = 2;
+    rpm_config.daily_token_limit = 0;
+    rpm_config.max_concurrent = 0;
+    quota::PgQuotaService rpm_quota(pool, rpm_config, 300);
+    CHECK(rpm_quota.try_acquire(bob_principal, 10, 0).decision.allowed);
+    CHECK(rpm_quota.try_acquire(bob_principal, 10, 0).decision.allowed);
+    auto rpm_denied = rpm_quota.try_acquire(bob_principal, 10, 0);
+    CHECK(!rpm_denied.decision.allowed);
+    CHECK(rpm_denied.decision.type == "rate_limited");
+    CHECK(rpm_denied.decision.retry_after_s >= 1);
+
     pool.exec(
         "TRUNCATE users, api_keys, sessions, messages, usage_records, request_dedup,"
-        " refresh_tokens, one_time_tokens, rate_limits "
+        " refresh_tokens, one_time_tokens, rate_limits, quota_reservations,"
+        " quota_stream_leases "
         "RESTART IDENTITY CASCADE");
   } catch (const std::exception& e) {
     std::printf("pg_tests failed with exception: %s\n", e.what());

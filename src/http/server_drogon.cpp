@@ -589,7 +589,7 @@ std::size_t default_worker_count() {
 
 struct ApiServer::Impl {
   Impl(const platform::Config& config, chat::ChatService& service, chat::SessionStore& store,
-       auth::AuthService* auth, quota::QuotaService* quota_service,
+       auth::AuthService* auth, quota::QuotaController* quota_service,
        usage::UsageSink* usage_sink, chat::IdempotencyStore* idempotency)
       : config(config),
         service(service),
@@ -650,7 +650,7 @@ struct ApiServer::Impl {
   chat::ChatService& service;
   chat::SessionStore& store;
   auth::AuthService* auth_ = nullptr;
-  quota::QuotaService* quota_ = nullptr;
+  quota::QuotaController* quota_ = nullptr;
   usage::UsageSink* usage_ = nullptr;
   chat::IdempotencyStore* idempotency_ = nullptr;
   const std::chrono::milliseconds heartbeat;
@@ -1283,7 +1283,7 @@ void ApiServer::Impl::handle_chat(const HttpRequestPtr& req, ResponseCallback&& 
           }
 
           long long daily_used = 0;
-          if (usage_ != nullptr) {
+          if (usage_ != nullptr && quota_ != nullptr && quota_->requires_daily_usage()) {
             daily_used = usage_->summary_today(principal.user_id).total_tokens();
           }
           quota::QuotaGuard guard;
@@ -1408,7 +1408,7 @@ void ApiServer::Impl::handle_non_stream(const auth::Principal& principal,
     }
 
     long long daily_used = 0;
-    if (usage_ != nullptr) {
+    if (usage_ != nullptr && quota_ != nullptr && quota_->requires_daily_usage()) {
       daily_used = usage_->summary_today(principal.user_id).total_tokens();
     }
     quota::QuotaGuard guard;
@@ -2491,7 +2491,7 @@ void ApiServer::Impl::begin_shutdown() {
 
 ApiServer::ApiServer(const platform::Config& config, chat::ChatService& service,
                      chat::SessionStore& store, auth::AuthService* auth,
-                     quota::QuotaService* quota, usage::UsageSink* usage,
+                     quota::QuotaController* quota, usage::UsageSink* usage,
                      chat::IdempotencyStore* idempotency)
     : impl_(std::make_unique<Impl>(config, service, store, auth, quota, usage, idempotency)) {}
 

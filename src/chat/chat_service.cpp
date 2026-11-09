@@ -110,7 +110,6 @@ class RecordingStream final : public llm::Stream {
     std::lock_guard<std::mutex> lock(commit_mutex_);
     if (committed_) return;
     committed_ = true;
-    quota_guard_.release();
 
     std::int64_t assistant_message_id = 0;
     if (!assistant_text_.empty()) {
@@ -137,7 +136,10 @@ class RecordingStream final : public llm::Stream {
       }
     }
 
-    if (usage_ == nullptr || recorded_) return;
+    if (usage_ == nullptr || recorded_) {
+      quota_guard_.release();
+      return;
+    }
     recorded_ = true;
 
     usage_event_.prompt_tokens =
@@ -158,6 +160,9 @@ class RecordingStream final : public llm::Stream {
     } catch (const std::exception& e) {
       platform::log_error("写入 usage 失败（session=" + session_id_ + "）: " + e.what());
     }
+    // 先落 usage（或确认写入失败），再释放 PG 配额预留；避免预留先删、用量还没写
+    // 导致同一时刻的配额检查看到“空窗”。
+    quota_guard_.release();
   }
 
   std::shared_ptr<llm::Stream> inner_;

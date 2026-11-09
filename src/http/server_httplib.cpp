@@ -210,7 +210,7 @@ thread_local ThreadRequestContext t_request;
 
 struct ApiServer::Impl {
   Impl(const platform::Config& config, chat::ChatService& service, chat::SessionStore& store,
-       auth::AuthService* auth, quota::QuotaService* quota_service,
+       auth::AuthService* auth, quota::QuotaController* quota_service,
        usage::UsageSink* usage_sink, chat::IdempotencyStore* idempotency)
       : config(config),
         service(service),
@@ -247,7 +247,7 @@ struct ApiServer::Impl {
   chat::ChatService& service;
   chat::SessionStore& store;
   auth::AuthService* auth = nullptr;
-  quota::QuotaService* quota = nullptr;
+  quota::QuotaController* quota = nullptr;
   usage::UsageSink* usage = nullptr;
   chat::IdempotencyStore* idempotency = nullptr;
   httplib::Server server;
@@ -633,7 +633,9 @@ void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response
 
     if (!replay) {
       long long daily_used = 0;
-      if (usage != nullptr) daily_used = usage->summary_today(principal.user_id).total_tokens();
+      if (usage != nullptr && quota != nullptr && quota->requires_daily_usage()) {
+        daily_used = usage->summary_today(principal.user_id).total_tokens();
+      }
 
       quota::QuotaGuard guard;
       if (quota != nullptr) {
@@ -1517,7 +1519,7 @@ void ApiServer::Impl::handle_history(const httplib::Request& req, httplib::Respo
 
 ApiServer::ApiServer(const platform::Config& config, chat::ChatService& service,
                      chat::SessionStore& store, auth::AuthService* auth,
-                     quota::QuotaService* quota, usage::UsageSink* usage,
+                     quota::QuotaController* quota, usage::UsageSink* usage,
                      chat::IdempotencyStore* idempotency)
     : impl_(std::make_unique<Impl>(config, service, store, auth, quota, usage, idempotency)) {}
 

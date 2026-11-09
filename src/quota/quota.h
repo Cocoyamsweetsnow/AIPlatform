@@ -1,11 +1,15 @@
-// 进程内配额：每用户 RPM、并发流、每日 token 配额。
+// 配额：每用户 RPM / 并发流 / 每日 token。
 //
-// 这是单实例实现；多副本部署需要 Redis/网关级限流（后续阶段）。
-// 静态管理员 / 未绑定用户（user_id=0）直接放行。
+// 两种实现：
+//   - QuotaService：进程内，memory 模式/单测；
+//   - PgQuotaService：PostgreSQL，多副本一致（见 quota/pg_quota.h）。
+//
+// HTTP 层只依赖 QuotaController，不关心后端。
 #pragma once
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -27,13 +31,11 @@ struct QuotaDecision {
   int retry_after_s = 1;
 };
 
-class QuotaService;
-
-/// 并发名额 RAII；析构时归还。可移动，不可拷贝。
+/// 并发/预留名额 RAII；析构时归还。可移动，不可拷贝。
 class QuotaGuard {
  public:
   QuotaGuard() = default;
-  QuotaGuard(QuotaService* service, std::int64_t user_id, bool active);
+  explicit QuotaGuard(std::function<void()> release);
   ~QuotaGuard();
 
   QuotaGuard(const QuotaGuard&) = delete;
@@ -44,23 +46,33 @@ class QuotaGuard {
   void release();
 
  private:
-  QuotaService* service_ = nullptr;
-  std::int64_t user_id_ = 0;
-  bool active_ = false;
+  std::function<void()> release_;
 };
 
-class QuotaService {
+struct QuotaAcquired {
+  QuotaDecision decision;
+  QuotaGuard guard;  // decision.allowed 为 false 时是 inactive guard
+};
+
+class QuotaController {
+ public:
+  virtual ~QuotaController() = default;
+
+  /// daily_used_tokens 只在 requires_daily_usage()=true 的实现里使用。
+  virtual QuotaAcquired try_acquire(const auth::Principal& principal,
+                                    int estimated_tokens,
+                                    long long daily_used_tokens) = 0;
+
+  /// true：HTTP 层需要先查 usage_records 当天汇总；PG 实现自己原子查。
+  virtual bool requires_daily_usage() const { return true; }
+};
+
+class QuotaService final : public QuotaController {
  public:
   explicit QuotaService(QuotaConfig config);
 
-  struct Acquired {
-    QuotaDecision decision;
-    QuotaGuard guard;  // decision.allowed 为 false 时是 inactive guard
-  };
-
-  /// daily_used_tokens 由调用方查 usage_records 得到；estimated_tokens 是本次预留。
-  Acquired try_acquire(const auth::Principal& principal, int estimated_tokens,
-                       long long daily_used_tokens);
+  QuotaAcquired try_acquire(const auth::Principal& principal, int estimated_tokens,
+                            long long daily_used_tokens) override;
 
   QuotaConfig config() const { return config_; }
 

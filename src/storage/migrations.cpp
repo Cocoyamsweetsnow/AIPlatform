@@ -132,6 +132,26 @@ CREATE TABLE rate_limits (
 );
 CREATE INDEX rate_limits_window_idx ON rate_limits (window_start);
 )SQL"},
+    {3, "distributed_quota_reservations", R"SQL(
+CREATE TABLE quota_reservations (
+  id         TEXT PRIMARY KEY,
+  user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  tokens     INT NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX quota_reservations_user_idx
+  ON quota_reservations (user_id, expires_at);
+
+CREATE TABLE quota_stream_leases (
+  id         TEXT PRIMARY KEY,
+  user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX quota_stream_leases_user_idx
+  ON quota_stream_leases (user_id, expires_at);
+)SQL"},
 };
 
 }  // namespace

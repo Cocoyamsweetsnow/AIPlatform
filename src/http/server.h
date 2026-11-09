@@ -23,7 +23,7 @@ class ApiServer {
  public:
   ApiServer(const platform::Config& config, chat::ChatService& service,
             chat::SessionStore& store, auth::AuthService* auth = nullptr,
-            quota::QuotaService* quota = nullptr, usage::UsageSink* usage = nullptr,
+            quota::QuotaController* quota = nullptr, usage::UsageSink* usage = nullptr,
             chat::IdempotencyStore* idempotency = nullptr);
   ~ApiServer();
 

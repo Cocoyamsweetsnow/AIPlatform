@@ -6,46 +6,39 @@
 
 namespace quota {
 
-QuotaGuard::QuotaGuard(QuotaService* service, std::int64_t user_id, bool active)
-    : service_(service), user_id_(user_id), active_(active) {}
+QuotaGuard::QuotaGuard(std::function<void()> release)
+    : release_(std::move(release)) {}
 
 QuotaGuard::~QuotaGuard() { release(); }
 
 QuotaGuard::QuotaGuard(QuotaGuard&& other) noexcept
-    : service_(other.service_), user_id_(other.user_id_), active_(other.active_) {
-  other.service_ = nullptr;
-  other.user_id_ = 0;
-  other.active_ = false;
+    : release_(std::move(other.release_)) {
+  other.release_ = nullptr;
 }
 
 QuotaGuard& QuotaGuard::operator=(QuotaGuard&& other) noexcept {
   if (this != &other) {
     release();
-    service_ = other.service_;
-    user_id_ = other.user_id_;
-    active_ = other.active_;
-    other.service_ = nullptr;
-    other.user_id_ = 0;
-    other.active_ = false;
+    release_ = std::move(other.release_);
+    other.release_ = nullptr;
   }
   return *this;
 }
 
 void QuotaGuard::release() {
-  if (active_ && service_ != nullptr) {
-    service_->release(user_id_);
+  if (release_) {
+    auto fn = std::move(release_);
+    release_ = nullptr;
+    fn();
   }
-  service_ = nullptr;
-  user_id_ = 0;
-  active_ = false;
 }
 
 QuotaService::QuotaService(QuotaConfig config) : config_(config) {}
 
-QuotaService::Acquired QuotaService::try_acquire(const auth::Principal& principal,
-                                                 int estimated_tokens,
-                                                 long long daily_used_tokens) {
-  Acquired result;
+QuotaAcquired QuotaService::try_acquire(const auth::Principal& principal,
+                                       int estimated_tokens,
+                                       long long daily_used_tokens) {
+  QuotaAcquired result;
   if (principal.is_admin || principal.user_id <= 0) {
     return result;
   }
@@ -101,7 +94,8 @@ QuotaService::Acquired QuotaService::try_acquire(const auth::Principal& principa
   }
 
   ++concurrent_[principal.user_id];
-  result.guard = QuotaGuard(this, principal.user_id, /*active=*/true);
+  const std::int64_t user_id = principal.user_id;
+  result.guard = QuotaGuard([this, user_id] { release(user_id); });
   return result;
 }
 

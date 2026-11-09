@@ -1,6 +1,8 @@
 // 用量记录与 token 估算的单元测试；不需要 PostgreSQL。
 #include <chrono>
 #include <cstdio>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -8,6 +10,7 @@
 #include "chat/session_store.h"
 #include "chat/token_estimate.h"
 #include "llm/mock_provider.h"
+#include "usage/async_usage_sink.h"
 #include "usage/usage.h"
 
 namespace {
@@ -24,9 +27,13 @@ int g_failures = 0;
 
 class FakeUsageSink final : public usage::UsageSink {
  public:
-  void record(const usage::UsageEvent& event) override { events.push_back(event); }
+  void record(const usage::UsageEvent& event) override {
+    std::lock_guard<std::mutex> lock(mutex);
+    events.push_back(event);
+  }
 
   usage::UsageSummary summary_today(std::int64_t) override {
+    std::lock_guard<std::mutex> lock(mutex);
     usage::UsageSummary summary;
     summary.requests = static_cast<long long>(events.size());
     for (const auto& event : events) {
@@ -36,6 +43,25 @@ class FakeUsageSink final : public usage::UsageSink {
     return summary;
   }
 
+  std::mutex mutex;
+  std::vector<usage::UsageEvent> events;
+};
+
+class FlakyUsageSink final : public usage::UsageSink {
+ public:
+  void record(const usage::UsageEvent& event) override {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (failures_left > 0) {
+      --failures_left;
+      throw std::runtime_error("simulated usage failure");
+    }
+    events.push_back(event);
+  }
+
+  usage::UsageSummary summary_today(std::int64_t) override { return {}; }
+
+  std::mutex mutex;
+  int failures_left = 2;
   std::vector<usage::UsageEvent> events;
 };
 
@@ -57,6 +83,37 @@ void test_estimate_tokens() {
   CHECK(chat::estimate_tokens("hello") >= 1);
   CHECK(chat::estimate_tokens("你好") >= 2);
   CHECK(chat::estimate_tokens("a") <= chat::estimate_tokens("hello world"));
+}
+
+void test_async_usage_sink() {
+  FakeUsageSink inner;
+  {
+    usage::AsyncUsageSink async(inner, 4);
+    for (int i = 0; i < 10; ++i) {
+      usage::UsageEvent event;
+      event.user_id = 7;
+      event.prompt_tokens = i;
+      async.record(event);
+    }
+    async.flush();
+    CHECK(async.pending() == 0);
+    {
+      std::lock_guard<std::mutex> lock(inner.mutex);
+      CHECK(inner.events.size() == 10);
+    }
+    CHECK(inner.summary_today(7).requests == 10);
+  }
+
+  FlakyUsageSink flaky;
+  {
+    usage::AsyncUsageSink async(flaky, 4);
+    usage::UsageEvent event;
+    event.user_id = 9;
+    async.record(event);
+    async.flush();
+    std::lock_guard<std::mutex> lock(flaky.mutex);
+    CHECK(flaky.events.size() == 1);
+  }
 }
 
 void test_usage_recorded() {
@@ -98,6 +155,7 @@ void test_usage_recorded() {
 int main() {
   std::printf("running usage tests...\n");
   test_estimate_tokens();
+  test_async_usage_sink();
   test_usage_recorded();
 
   if (g_failures == 0) {

@@ -74,8 +74,12 @@
 **推荐：单机 A；一旦上多副本，D4 必须切 B**（否则配额会被放大 N 倍）。
 
 > **2026-11-08 更新**：M3 已按单机 A 落地进程内令牌桶（RPM/并发）+ `usage_records`
-> 日汇总；每日 token 配额是“先查后写”，多副本仍会放大/超卖。上多副本前切 Redis
-> 或网关限流，详见 [adr/0004-quota-usage.md](adr/0004-quota-usage.md)。
+> 日汇总。
+>
+> **2026-11-09 更新（P0）**：多副本配额已改用 **PostgreSQL 原子预留**（`rate_limits`
+> 固定窗口、`quota_reservations`/`quota_stream_leases` + advisory lock），不再依赖
+> Redis；memory 模式仍是进程内实现。usage 流水默认异步写，可用
+> `AIP_USAGE_ASYNC=false` 切同步。详见 [adr/0008](adr/0008-distributed-quota.md)。
 
 ### D5. 部署形态
 

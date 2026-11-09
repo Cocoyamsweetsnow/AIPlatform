@@ -14,6 +14,9 @@
 #include "llm/mock_provider.h"
 #include "llm/openai_provider.h"
 #include "quota/quota.h"
+#ifdef AIP_WITH_POSTGRES
+#include "quota/pg_quota.h"
+#endif
 
 #include "auth/auth_service.h"
 #if defined(AIP_WITH_AUTH)
@@ -28,6 +31,7 @@
 #include "chat/pg_session_store.h"
 #include "storage/db.h"
 #include "storage/migrations.h"
+#include "usage/async_usage_sink.h"
 #include "usage/pg_usage_sink.h"
 #endif
 
@@ -90,6 +94,7 @@ int main() {
 #ifdef AIP_WITH_POSTGRES
     std::unique_ptr<storage::DbPool> db;
     std::unique_ptr<usage::PgUsageSink> usage_sink;
+    std::unique_ptr<usage::AsyncUsageSink> async_usage;
 #ifdef AIP_WITH_AUTH
     std::unique_ptr<auth::PgUserStore> user_store;
     std::unique_ptr<auth::AuthService> auth_service;
@@ -109,7 +114,14 @@ int main() {
       idempotency = std::make_unique<chat::PgIdempotencyStore>(*db,
                                                                config.idempotency_ttl_s);
       usage_sink = std::make_unique<usage::PgUsageSink>(*db);
-      usage_ptr = usage_sink.get();
+      if (config.usage_async) {
+        async_usage = std::make_unique<usage::AsyncUsageSink>(*usage_sink);
+        usage_ptr = async_usage.get();
+        log_info("usage: 异步写入（队列满/退出时兜底）");
+      } else {
+        usage_ptr = usage_sink.get();
+        log_info("usage: 同步写入（严格账实一致，流结束会等一次 DB）");
+      }
       log_info("storage: postgres（会话/消息持久化，进程重启不丢）");
 #ifdef AIP_WITH_AUTH
       user_store = std::make_unique<auth::PgUserStore>(*db);
@@ -172,10 +184,21 @@ int main() {
     quota_config.rpm_limit = config.rpm_limit;
     quota_config.daily_token_limit = config.daily_token_limit;
     quota_config.max_concurrent = config.max_concurrent_per_user;
-    quota::QuotaService quota_service(quota_config);
+    std::unique_ptr<quota::QuotaController> quota_controller;
+#if defined(AIP_WITH_POSTGRES)
+    if (config.postgres_enabled()) {
+      quota_controller = std::make_unique<quota::PgQuotaService>(
+          *db, quota_config, config.quota_lease_s);
+      log_info("quota: PostgreSQL 原子预留（多副本一致）");
+    } else
+#endif
+    {
+      quota_controller = std::make_unique<quota::QuotaService>(quota_config);
+      log_info("quota: 进程内（单实例）");
+    }
 
-    http::ApiServer server(config, service, *store, auth_ptr, &quota_service, usage_ptr,
-                      idempotency.get());
+    http::ApiServer server(config, service, *store, auth_ptr, quota_controller.get(),
+                           usage_ptr, idempotency.get());
     std::signal(SIGPIPE, SIG_IGN);  // 客户端断开时不要被 SIGPIPE 干掉
 
     log_info("try: curl -N http://127.0.0.1:" + std::to_string(config.port) +

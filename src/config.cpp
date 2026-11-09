@@ -79,6 +79,7 @@ Config Config::from_env() {
   c.metrics_enabled = env_bool("AIP_METRICS_ENABLED", c.metrics_enabled);
   c.metrics_token = env_str("AIP_METRICS_TOKEN", c.metrics_token);
   c.trust_proxy = env_bool("AIP_TRUST_PROXY", c.trust_proxy);
+  c.usage_async = env_bool("AIP_USAGE_ASYNC", c.usage_async);
 
   c.provider = env_str("AIP_PROVIDER", c.provider);
   c.base_url = env_str("AIP_BASE_URL", c.base_url);
@@ -134,6 +135,7 @@ Config Config::from_env() {
   c.daily_token_limit = env_int("AIP_DAILY_TOKEN_LIMIT", c.daily_token_limit);
   c.max_concurrent_per_user =
       env_int("AIP_MAX_CONCURRENT_PER_USER", c.max_concurrent_per_user);
+  c.quota_lease_s = env_int("AIP_QUOTA_LEASE_S", c.quota_lease_s);
   c.idempotency_ttl_s = env_int("AIP_IDEMPOTENCY_TTL_S", c.idempotency_ttl_s);
 
   c.io_threads = env_int("AIP_IO_THREADS", c.io_threads);
@@ -257,6 +259,9 @@ Config Config::from_env() {
   }
   if (c.max_concurrent_per_user < 0 || c.max_concurrent_per_user > 1000) {
     throw std::runtime_error("AIP_MAX_CONCURRENT_PER_USER 应在 [0, 1000]（0 表示不限）");
+  }
+  if (c.quota_lease_s < 60 || c.quota_lease_s > 86400) {
+    throw std::runtime_error("AIP_QUOTA_LEASE_S 应在 [60, 86400] 秒");
   }
   if (c.idempotency_ttl_s < 30 || c.idempotency_ttl_s > 3600) {
     throw std::runtime_error("AIP_IDEMPOTENCY_TTL_S 应在 [30, 3600] 秒");

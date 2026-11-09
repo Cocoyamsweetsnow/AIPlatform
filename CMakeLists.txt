@@ -94,6 +94,7 @@ set(AIP_CORE_SOURCES
   src/chat/context_builder.cpp
   src/chat/idempotency.cpp
   src/quota/quota.cpp
+  src/usage/async_usage_sink.cpp
 )
 if(AIPLATFORM_WITH_POSTGRES)
   list(APPEND AIP_CORE_SOURCES
@@ -101,6 +102,7 @@ if(AIPLATFORM_WITH_POSTGRES)
     src/storage/migrations.cpp
     src/chat/pg_session_store.cpp
     src/chat/pg_idempotency_store.cpp
+    src/quota/pg_quota.cpp
     src/usage/pg_usage_sink.cpp
   )
 endif()
