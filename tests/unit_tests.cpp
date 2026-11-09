@@ -235,15 +235,56 @@ void test_web_assets() {
 void test_key_ring_round_robin() {
   llm::KeyRing ring({"key-a", "key-b", "key-c"});
   CHECK(ring.size() == 3);
-  CHECK(ring.next() == "key-a");
-  CHECK(ring.next() == "key-b");
-  CHECK(ring.next() == "key-c");
-  CHECK(ring.next() == "key-a");  // 回到起点，保证多请求均匀分摊
+  auto first = ring.acquire();
+  auto second = ring.acquire();
+  auto third = ring.acquire();
+  auto fourth = ring.acquire();
+  CHECK(first.has_value() && first->key == "key-a");
+  CHECK(second.has_value() && second->key == "key-b");
+  CHECK(third.has_value() && third->key == "key-c");
+  CHECK(fourth.has_value() && fourth->key == "key-a");  // 回到起点，保证多请求均匀分摊
+  CHECK(ring.available() == 3);
 
   llm::KeyRing empty({});
   CHECK(empty.empty());
   CHECK(empty.size() == 0);
   CHECK(empty.next().empty());
+  CHECK(!empty.acquire().has_value());
+
+  llm::KeyRingConfig limiter;
+  limiter.rpm_limit = 2;
+  limiter.failure_threshold = 100;
+  llm::KeyRing rpm({"only"}, limiter);
+  CHECK(rpm.acquire().has_value());
+  CHECK(rpm.acquire().has_value());
+  CHECK(!rpm.acquire().has_value());  // 第 3 次被每 Key RPM 拦住
+
+  llm::KeyRingConfig breaker;
+  breaker.failure_threshold = 2;
+  breaker.cooldown_s = 60;
+  breaker.cooldown_max_s = 60;
+  llm::KeyRing cooled({"a", "b"}, breaker);
+  auto a = cooled.acquire();
+  CHECK(a.has_value() && a->index == 0);
+  CHECK(!cooled.record_failure(a->index, 500, /*retryable=*/true));  // 1 次，未到阈值
+  auto b = cooled.acquire();
+  CHECK(b.has_value() && b->index == 1);
+  CHECK(!cooled.record_failure(b->index, 500, /*retryable=*/true));  // 每个 Key 独立计数：1 次
+  CHECK(cooled.record_failure(b->index, 500, /*retryable=*/true));  // 第 2 次 -> 冷却
+  CHECK(cooled.available() == 1);
+  CHECK(cooled.cooldown_remaining_ms(b->index) > 0);
+  auto next = cooled.acquire();
+  CHECK(next.has_value() && next->index == 0);  // 跳过冷却中的 b
+
+  llm::KeyRingConfig rate;
+  rate.failure_threshold = 3;
+  rate.cooldown_s = 1;
+  rate.cooldown_max_s = 1;
+  llm::KeyRing ratelimited({"x"}, rate);
+  auto x = ratelimited.acquire();
+  CHECK(x.has_value());
+  CHECK(ratelimited.record_failure(x->index, 429, /*retryable=*/true));  // 429 立即冷却
+  CHECK(!ratelimited.acquire().has_value());
 }
 
 void test_config_parses_api_keys() {

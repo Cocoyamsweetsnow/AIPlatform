@@ -65,6 +65,11 @@ int main() {
       options.include_usage = config.include_usage;
       options.max_retries = config.max_retries;
       options.retry_base_ms = config.retry_base_ms;
+      options.key_rpm_limit = config.key_rpm_limit;
+      options.key_tpm_limit = config.key_tpm_limit;
+      options.key_failure_threshold = config.key_failure_threshold;
+      options.key_cooldown_s = config.key_cooldown_s;
+      options.key_cooldown_max_s = config.key_cooldown_max_s;
       provider = llm::make_openai_provider(std::move(options));
       log_info("model gateway: " + config.base_url + " (model=" + config.model +
                ", keys=" + std::to_string(config.api_keys.size()) +

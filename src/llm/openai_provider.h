@@ -21,6 +21,13 @@ struct OpenAiOptions {
   // 0 = 关闭重试；退避为 base * 2^attempt，单次最多 5 秒。
   int max_retries = 2;
   int retry_base_ms = 300;
+
+  // 每 Key 的冷却/熔断与 RPM/TPM（0 = 不限）。
+  int key_rpm_limit = 0;
+  long long key_tpm_limit = 0;
+  int key_failure_threshold = 3;
+  int key_cooldown_s = 15;
+  int key_cooldown_max_s = 300;
 };
 
 std::unique_ptr<Provider> make_openai_provider(OpenAiOptions options);

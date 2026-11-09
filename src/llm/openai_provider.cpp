@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/log.h"
+#include "common/metrics.h"
 #include "llm/event_queue.h"
 #include "llm/key_ring.h"
 #include "llm/threaded_stream.h"
@@ -20,6 +21,7 @@ namespace llm {
 namespace {
 
 using json = nlohmann::json;
+namespace metrics = platform::metrics;
 
 constexpr int kMaxRetryDelayMs = 5000;
 
@@ -152,13 +154,62 @@ class OpenAiStream final : public ThreadedStream {
     fail(last_error);
   }
 
+  std::string display_model() const {
+    return req_.model.empty() ? opts_.default_model : req_.model;
+  }
+
   AttemptResult attempt_once() {
-    const std::string key = keys_ == nullptr ? std::string{} : keys_->next();
-    if (key.empty()) {
+    if (keys_ == nullptr) {
       attempt_error_ = "没有可用的 AIP_API_KEY / AIP_API_KEYS";
+      metrics::inc_upstream_request(display_model(), "keys_unavailable");
+      return AttemptResult::Fatal;
+    }
+    auto lease = keys_->acquire();
+    if (!lease.has_value()) {
+      attempt_error_ = "所有上游 Key 均在冷却或限流中，请稍后重试";
+      metrics::inc_upstream_request(display_model(), "keys_unavailable");
+      metrics::set_upstream_keys_available(0);
       return AttemptResult::Fatal;
     }
 
+    const auto started = std::chrono::steady_clock::now();
+    AttemptResult result = attempt_http(lease->index, lease->key);
+    // 单 Key 的 401/403 可能是 Key 本身失效；多 Key 时换一个 Key 再试，
+    // 单 Key 则保持原来的「鉴权错误不重试」语义。
+    if (result == AttemptResult::Fatal && (http_status_ == 401 || http_status_ == 403) &&
+        keys_->size() > 1) {
+      result = AttemptResult::Retryable;
+    }
+    const double seconds = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - started)
+                               .count();
+
+    const char* outcome = "fatal";
+    if (result == AttemptResult::Success) {
+      outcome = "success";
+    } else if (result == AttemptResult::Retryable) {
+      outcome = "retryable";
+    } else if (result == AttemptResult::Cancelled) {
+      outcome = "cancelled";
+    }
+    metrics::inc_upstream_request(display_model(), outcome);
+    metrics::observe_upstream_duration(display_model(), seconds);
+
+    if (result == AttemptResult::Success) {
+      keys_->record_success(lease->index);
+      keys_->record_usage(lease->index, prompt_tokens_, completion_tokens_);
+    } else if (result == AttemptResult::Retryable || result == AttemptResult::Fatal) {
+      if (keys_->record_failure(lease->index, http_status_, result == AttemptResult::Retryable)) {
+        metrics::inc_key_cooldown();
+        platform::log_warn("上游 Key #" + std::to_string(lease->index) + " 进入冷却（HTTP " +
+                           std::to_string(http_status_) + "）");
+      }
+    }
+    metrics::set_upstream_keys_available(keys_->available());
+    return result;
+  }
+
+  AttemptResult attempt_http(std::size_t /*key_index*/, const std::string& key) {
     const std::string url = opts_.base_url + "/chat/completions";
     const std::string payload = build_payload(req_, opts_);
     const std::string auth = "Authorization: Bearer " + key;
@@ -451,7 +502,9 @@ class OpenAiStream final : public ThreadedStream {
 class OpenAiProvider final : public Provider {
  public:
   explicit OpenAiProvider(OpenAiOptions opts)
-      : opts_(std::move(opts)), keys_(std::make_shared<KeyRing>(collect_keys(opts_))) {}
+      : opts_(std::move(opts)), keys_(std::make_shared<KeyRing>(collect_keys(opts_), key_config(opts_))) {
+    metrics::set_upstream_keys_available(keys_->available());
+  }
 
   std::string name() const override { return "openai-compatible"; }
 
@@ -467,6 +520,16 @@ class OpenAiProvider final : public Provider {
     std::vector<std::string> keys = opts.api_keys;
     if (keys.empty() && !opts.api_key.empty()) keys.push_back(opts.api_key);
     return keys;
+  }
+
+  static KeyRingConfig key_config(const OpenAiOptions& opts) {
+    KeyRingConfig config;
+    config.rpm_limit = opts.key_rpm_limit;
+    config.tpm_limit = opts.key_tpm_limit;
+    config.failure_threshold = opts.key_failure_threshold;
+    config.cooldown_s = opts.key_cooldown_s;
+    config.cooldown_max_s = opts.key_cooldown_max_s;
+    return config;
   }
 
   OpenAiOptions opts_;

@@ -94,6 +94,13 @@ Config Config::from_env() {
   c.include_usage = env_bool("AIP_INCLUDE_USAGE", c.include_usage);
   c.max_retries = env_int("AIP_MAX_RETRIES", c.max_retries);
   c.retry_base_ms = env_int("AIP_RETRY_BASE_MS", c.retry_base_ms);
+  c.key_rpm_limit = env_int("AIP_KEY_RPM_LIMIT", c.key_rpm_limit);
+  c.key_tpm_limit = env_int("AIP_KEY_TPM_LIMIT", c.key_tpm_limit);
+  c.key_failure_threshold =
+      env_int("AIP_KEY_FAILURE_THRESHOLD", c.key_failure_threshold);
+  c.key_cooldown_s = env_int("AIP_KEY_COOLDOWN_S", c.key_cooldown_s);
+  c.key_cooldown_max_s =
+      env_int("AIP_KEY_COOLDOWN_MAX_S", c.key_cooldown_max_s);
 
   c.system_prompt = env_str("AIP_SYSTEM_PROMPT", c.system_prompt);
   c.max_history_messages = env_int("AIP_MAX_HISTORY", c.max_history_messages);
@@ -147,6 +154,21 @@ Config Config::from_env() {
   }
   if (c.retry_base_ms < 0 || c.retry_base_ms > 10000) {
     throw std::runtime_error("AIP_RETRY_BASE_MS 应在 [0, 10000]");
+  }
+  if (c.key_rpm_limit < 0 || c.key_rpm_limit > 1000000) {
+    throw std::runtime_error("AIP_KEY_RPM_LIMIT 应在 [0, 1000000]");
+  }
+  if (c.key_tpm_limit < 0 || c.key_tpm_limit > 1000000000) {
+    throw std::runtime_error("AIP_KEY_TPM_LIMIT 应在 [0, 1000000000]");
+  }
+  if (c.key_failure_threshold < 1 || c.key_failure_threshold > 100) {
+    throw std::runtime_error("AIP_KEY_FAILURE_THRESHOLD 应在 [1, 100]");
+  }
+  if (c.key_cooldown_s < 1 || c.key_cooldown_s > 3600) {
+    throw std::runtime_error("AIP_KEY_COOLDOWN_S 应在 [1, 3600]");
+  }
+  if (c.key_cooldown_max_s < c.key_cooldown_s || c.key_cooldown_max_s > 86400) {
+    throw std::runtime_error("AIP_KEY_COOLDOWN_MAX_S 应在 [AIP_KEY_COOLDOWN_S, 86400]");
   }
   if (c.io_threads < 0 || c.io_threads > 64) {
     throw std::runtime_error("AIP_IO_THREADS 应在 [0, 64]（0 表示按核数自动）");

@@ -86,6 +86,7 @@ set(AIP_CORE_SOURCES
   src/common/metrics.cpp
   src/common/structured_log.cpp
   src/llm/mock_provider.cpp
+  src/llm/key_ring.cpp
   src/llm/openai_provider.cpp
   src/chat/session_store.cpp
   src/chat/chat_service.cpp

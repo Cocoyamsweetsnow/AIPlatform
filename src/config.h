@@ -32,6 +32,13 @@ struct Config {
   int max_retries{2};        // 上游失败重试次数（仅首 token 前）
   int retry_base_ms{300};    // 指数退避基准；实际单次最多 5 秒
 
+  // 多 Key 治理（0 = 不限；仅 openai provider 使用）
+  int key_rpm_limit{0};          // 每个 Key 每分钟请求数
+  int key_tpm_limit{0};          // 每个 Key 每分钟 token 数
+  int key_failure_threshold{3};  // 连续失败多少次进入冷却
+  int key_cooldown_s{15};        // 首次冷却秒数
+  int key_cooldown_max_s{300};   // 冷却上限
+
   // 对话
   std::string system_prompt{"你是一个乐于助人的 AI 助手，回答简洁准确。"};
   int max_history_messages{20};

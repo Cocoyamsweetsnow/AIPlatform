@@ -21,6 +21,7 @@
 - ✅ 上游 SSE 增量解析、非流式自动降级、上游错误映射
 - ✅ 上游失败重试（仅首 token 前；408/409/425/429/5xx + 连接类错误，指数退避 + 抖动）
 - ✅ 多 API Key 轮转（`AIP_API_KEYS`，重试自动换 key）
+- ✅ 每 Key 熔断/冷却、RPM/TPM、Key 可用数指标
 - ✅ 客户端断开 → 取消上游请求（不浪费 token）
 - ✅ 多轮上下文（内存 LRU 或 PostgreSQL 会话存储）
 - ✅ **PostgreSQL 持久化（M1）**：`AIP_STORAGE=postgres` 时会话/消息落库，重启不丢；
@@ -403,7 +404,12 @@ Prometheus text exposition（`text/plain; version=0.0.4`）。默认开启，可
 - 只在「还没有向客户端吐第一个 token」时重试；已经吐字后失败直接发 `event: error`，避免前端看到重复内容。
 - 可重试：HTTP 408/409/425/429/5xx，以及连接/收包/发包类 curl 错误；401/403/400 等参数或鉴权错误不重试，总超时也不重试（避免把 120s 等待放大成 6 分钟）。
 - 退避：`AIP_RETRY_BASE_MS` 起步（默认 300ms）按 2 倍递增，单次最多 5s，另加 <100ms 抖动；`AIP_MAX_RETRIES=0` 关闭。
-- 多 Key：`AIP_API_KEYS=a,b,c` 按请求轮转，重试时自动换下一个。单 key 的熔断/配额还没做（阶段 4）。
+- 多 Key：`AIP_API_KEYS=a,b,c` 按请求轮转，重试时自动换下一个。
+- Key 治理：429/5xx/网络错误累计到 `AIP_KEY_FAILURE_THRESHOLD` 后进入冷却，
+  冷却按 `AIP_KEY_COOLDOWN_S` 指数退避、封顶 `AIP_KEY_COOLDOWN_MAX_S`；429 立即冷却；
+  多 Key 下 401/403 会换 Key 再试。每 Key 还支持 `AIP_KEY_RPM_LIMIT` /
+  `AIP_KEY_TPM_LIMIT`，所有 Key 都不可用时快速失败，不再排队等上游。
+  指标见 `aip_upstream_key_cooldowns_total`、`aip_upstream_keys_available`。
 - 每次尝试仍受 `AIP_TIMEOUT_S` 限制；重试只增加次数，不共享总超时。
 - 重试会放大上游成本，默认 2 次是折中；成本敏感可设 0~1。
 
