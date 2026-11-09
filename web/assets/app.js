@@ -190,8 +190,14 @@
     var access = typeof raw.accessToken === "string" ? raw.accessToken : "";
     var refresh = typeof raw.refreshToken === "string" ? raw.refreshToken : "";
     var user = normalizeUser(raw.user);
-    if (!access || !user) return null;
-    return { accessToken: access, refreshToken: refresh, user: user };
+    var cookieMode = raw.cookieMode === true;
+    if ((!access && !cookieMode) || !user) return null;
+    return {
+      accessToken: access,
+      refreshToken: refresh,
+      user: user,
+      cookieMode: cookieMode
+    };
   }
 
   function loadAuth() {
@@ -247,13 +253,18 @@
   }
 
   function applyTokenPair(pair) {
-    if (!pair || typeof pair.access_token !== "string" || !pair.access_token) return false;
+    if (!pair || !pair.user) return false;
     var user = normalizeUser(pair.user) || authUser();
     if (!user) return false;
+    var cookieMode = cookieAuthMode();
+    var access = typeof pair.access_token === "string" ? pair.access_token : "";
+    var refresh = typeof pair.refresh_token === "string" ? pair.refresh_token : "";
+    if (!cookieMode && (!access || !refresh)) return false;
     state.auth = {
-      accessToken: pair.access_token,
-      refreshToken: typeof pair.refresh_token === "string" ? pair.refresh_token : "",
-      user: user
+      accessToken: access,
+      refreshToken: refresh,
+      user: user,
+      cookieMode: cookieMode
     };
     persistAuth();
     updateAuthUI();
@@ -271,12 +282,20 @@
     return Boolean(auth && auth.user_accounts);
   }
 
+  function cookieAuthMode() {
+    var auth = state.config && state.config.auth;
+    if (auth && auth.cookie_mode) return true;
+    return Boolean(state.auth && state.auth.cookieMode);
+  }
+
   function authToken() {
+    if (cookieAuthMode() && state.auth) return "";
     if (state.auth && state.auth.accessToken) return state.auth.accessToken;
     return state.prefs.token;
   }
 
   function hasCredentials() {
+    if (cookieAuthMode() && state.auth && state.auth.user) return true;
     return Boolean(authToken());
   }
 
@@ -1256,15 +1275,32 @@
       });
   }
 
-  function logout() {
-    if (!authUser()) return;
-    if (!window.confirm("退出登录？本地会话仍会保留在该账号下。")) return;
-    stopStreaming();
+  function finishLogout() {
     clearAuth();
     reloadSessionScope();
     updateServiceUI();
     if (userAuthAvailable()) showAuthGate("login");
     else toast("已退出登录，已切换回本地会话", "success");
+  }
+
+  function logout() {
+    if (!authUser()) return;
+    if (!window.confirm("退出登录？本地会话仍会保留在该账号下。")) return;
+    stopStreaming();
+    if (cookieAuthMode()) {
+      fetch("/v1/auth/logout", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: "{}"
+      })
+        .catch(function () {
+          /* 网络失败也清理本地登录态；Cookie 会在过期后失效 */
+        })
+        .then(finishLogout);
+      return;
+    }
+    finishLogout();
   }
 
   function needsCredentials() {
@@ -1427,6 +1463,34 @@
     updateThemeButtons();
   }
 
+  // Cookie 模式没有 localStorage token，启动时直接问 /v1/auth/me 恢复会话。
+  function restoreCookieSession() {
+    if (!cookieAuthMode()) return Promise.resolve();
+    return fetch("/v1/auth/me", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" }
+    })
+      .then(function (response) {
+        if (!response.ok) return null;
+        return response.json();
+      })
+      .then(function (body) {
+        var user = normalizeUser(body && body.user);
+        if (!user) return;
+        state.auth = {
+          accessToken: "",
+          refreshToken: "",
+          user: user,
+          cookieMode: true
+        };
+        persistAuth();
+        updateAuthUI();
+      })
+      .catch(function () {
+        /* 无 Cookie 或网络失败：保持未登录，由登录页处理 */
+      });
+  }
+
   // 页面加载时用 /v1/auth/me 验证本地保存的 access token；过期则自动 refresh 一次。
   function validateSession() {
     if (!state.auth) return Promise.resolve();
@@ -1528,15 +1592,17 @@
   }
 
   function refreshSession() {
-    if (!state.auth || !state.auth.refreshToken) {
+    var useCookie = cookieAuthMode();
+    if (!state.auth || (!useCookie && !state.auth.refreshToken)) {
       return Promise.reject(new Error("没有可用的 refresh token"));
     }
     if (refreshPromise) return refreshPromise;
     var refreshToken = state.auth.refreshToken;
     refreshPromise = fetch("/v1/auth/refresh", {
       method: "POST",
+      credentials: "same-origin",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_token: refreshToken })
+      body: useCookie ? "{}" : JSON.stringify({ refresh_token: refreshToken })
     })
       .then(function (response) {
         if (!response.ok) throw new Error("刷新登录失败（HTTP " + response.status + "）");
@@ -1569,13 +1635,14 @@
   function apiFetch(url, init, retry) {
     var options = init ? Object.assign({}, init) : {};
     options.headers = Object.assign({}, options.headers || {}, authHeaders(false));
+    options.credentials = options.credentials || "same-origin";
     return fetch(url, options).then(function (response) {
       var canRetry =
         retry !== false &&
         response.status === 401 &&
         !isPublicAuthPath(url) &&
         state.auth &&
-        state.auth.refreshToken;
+        (state.auth.refreshToken || cookieAuthMode());
       if (!canRetry) return response;
       return refreshSession()
         .then(function () {
@@ -2448,16 +2515,20 @@
     updateComposerState();
     updateServiceUI();
 
-    loadConfig().then(function () {
-      updateServiceUI();
-      if (userAuthAvailable() && !authUser()) {
-        showAuthGate("login");
-      } else if (!userAuthAvailable()) {
-        hideAuthGate();
-      }
-      validateSession();
-      loadHealth();
-    });
+    loadConfig()
+      .then(function () {
+        return restoreCookieSession();
+      })
+      .then(function () {
+        updateServiceUI();
+        if (userAuthAvailable() && !authUser()) {
+          showAuthGate("login");
+        } else if (!userAuthAvailable()) {
+          hideAuthGate();
+        }
+        validateSession();
+        loadHealth();
+      });
 
     // 本地只有会话 ID、没有消息（例如清过站点数据）时，从服务端补一次历史。
     var restored = currentSession();

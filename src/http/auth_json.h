@@ -3,8 +3,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "auth/errors.h"
 #include "auth/types.h"
@@ -42,6 +45,67 @@ inline nlohmann::json register_outcome_json(const auth::RegisterOutcome& outcome
                           {"message", "验证邮件已发送，请先验证邮箱后再登录"}};
   }
   return token_pair_json(outcome.tokens);
+}
+
+/// 从 Cookie 头里取一个值；找不到返回 nullopt。
+inline std::optional<std::string> cookie_value(std::string_view header,
+                                               std::string_view name) {
+  std::size_t start = 0;
+  while (start < header.size()) {
+    const std::size_t end = header.find(';', start);
+    std::string_view part =
+        header.substr(start, end == std::string_view::npos ? header.size() - start
+                                                           : end - start);
+    while (!part.empty() && std::isspace(static_cast<unsigned char>(part.front()))) {
+      part.remove_prefix(1);
+    }
+    while (!part.empty() && std::isspace(static_cast<unsigned char>(part.back()))) {
+      part.remove_suffix(1);
+    }
+    if (part.size() > name.size() && part.compare(0, name.size(), name) == 0 &&
+        part[name.size()] == '=') {
+      return std::string(part.substr(name.size() + 1));
+    }
+    if (end == std::string_view::npos) break;
+    start = end + 1;
+  }
+  return std::nullopt;
+}
+
+inline std::string make_cookie(const std::string& name, const std::string& value,
+                               long long max_age_s, const std::string& path,
+                               bool secure) {
+  std::string cookie = name + "=" + value + "; Path=" + path + "; Max-Age=" +
+                       std::to_string(max_age_s) + "; HttpOnly; SameSite=Strict";
+  if (secure) cookie += "; Secure";
+  return cookie;
+}
+
+/// 比较 Origin 与 public_base_url 的 scheme://host[:port]；用于 Cookie 模式的 CSRF 防护。
+inline bool same_origin(std::string_view origin, std::string_view base_url) {
+  const auto normalize = [](std::string_view value) {
+    const std::size_t scheme = value.find("://");
+    if (scheme == std::string_view::npos) return std::string{};
+    const std::size_t start = scheme + 3;
+    const std::size_t slash = value.find('/', start);
+    std::string out(value.substr(0, slash == std::string_view::npos ? value.size() : slash));
+    for (char& c : out) {
+      if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return out;
+  };
+  const std::string a = normalize(origin);
+  const std::string b = normalize(base_url);
+  return !a.empty() && a == b;
+}
+
+/// Cookie 模式下不把 token 放进响应体，只返回用户信息。
+inline nlohmann::json auth_response_json(const auth::TokenPair& pair, bool cookie_mode) {
+  if (!cookie_mode) return token_pair_json(pair);
+  return nlohmann::json{{"token_type", "Bearer"},
+                        {"cookie_mode", true},
+                        {"expires_in", pair.expires_in},
+                        {"user", user_json(pair.user)}};
 }
 
 inline nlohmann::json api_key_json(const auth::ApiKeyInfo& info) {

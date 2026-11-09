@@ -61,6 +61,8 @@ struct Config {
 
   // 账号安全（M6）
   bool email_verification_required{false};
+  bool auth_cookie_mode{false};    // token 放 httpOnly Cookie（需配合 BFF/HTTPS）
+  bool auth_cookie_secure{false};  // Set-Cookie 是否带 Secure
   std::string public_base_url{"http://127.0.0.1:8080"};
   std::string smtp_url;
   std::string smtp_from{"noreply@aiplatform.local"};

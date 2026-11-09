@@ -121,6 +121,8 @@ Config Config::from_env() {
 
   c.email_verification_required =
       env_bool("AIP_EMAIL_VERIFICATION_REQUIRED", c.email_verification_required);
+  c.auth_cookie_mode = env_bool("AIP_AUTH_COOKIE_MODE", c.auth_cookie_mode);
+  c.auth_cookie_secure = env_bool("AIP_AUTH_COOKIE_SECURE", c.auth_cookie_secure);
   c.public_base_url = env_str("AIP_PUBLIC_BASE_URL", c.public_base_url);
   c.smtp_url = env_str("AIP_SMTP_URL", c.smtp_url);
   c.smtp_from = env_str("AIP_SMTP_FROM", c.smtp_from);
@@ -250,6 +252,12 @@ Config Config::from_env() {
   }
   if (!c.public_base_url.empty() && c.public_base_url.back() == '/') {
     c.public_base_url.pop_back();
+  }
+  if (c.auth_cookie_mode && c.public_base_url.empty()) {
+    throw std::runtime_error("AIP_AUTH_COOKIE_MODE=1 时必须设置 AIP_PUBLIC_BASE_URL");
+  }
+  if (c.auth_cookie_mode && c.jwt_secret.empty()) {
+    throw std::runtime_error("AIP_AUTH_COOKIE_MODE=1 时必须设置 AIP_JWT_SECRET（JWT 用户体系）");
   }
   if (c.rpm_limit < 0 || c.rpm_limit > 1000000) {
     throw std::runtime_error("AIP_RPM_LIMIT 应在 [0, 1000000]（0 表示不限）");

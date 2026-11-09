@@ -38,6 +38,8 @@ inline std::string public_config_json(const platform::Config& config, const char
         {"registration", user_accounts},
         {"static_token", !config.api_token.empty()},
         {"email_verification_required", config.email_verification_required},
+        {"cookie_mode", config.auth_cookie_mode},
+        {"cookie_secure", config.auth_cookie_secure},
         {"password_reset", true},
         {"refresh_rotation", true},
         {"access_ttl_s", config.jwt_ttl_s},

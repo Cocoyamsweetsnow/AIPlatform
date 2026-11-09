@@ -48,17 +48,19 @@
     setMessage("正在验证…");
     post("/v1/auth/verify-email", { token: token })
       .then(function (pair) {
-        try {
-          window.localStorage.setItem(
-            "aiplatform.auth.v1",
-            JSON.stringify({
-              accessToken: pair.access_token,
-              refreshToken: pair.refresh_token,
-              user: pair.user
-            })
-          );
-        } catch (error) {
-          /* 无痕模式下写不了 localStorage，仍然允许手动登录 */
+        if (pair.access_token) {
+          try {
+            window.localStorage.setItem(
+              "aiplatform.auth.v1",
+              JSON.stringify({
+                accessToken: pair.access_token,
+                refreshToken: pair.refresh_token,
+                user: pair.user
+              })
+            );
+          } catch (error) {
+            /* 无痕模式下写不了 localStorage，仍然允许手动登录 */
+          }
         }
         setMessage("邮箱验证成功，正在进入对话…", "ok");
         window.setTimeout(function () {

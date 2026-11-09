@@ -132,6 +132,34 @@ void add_cors(httplib::Response& res) {
   res.set_header("Access-Control-Expose-Headers", "X-Session-Id, X-Request-Id");
 }
 
+void set_auth_cookies(httplib::Response& res, const auth::TokenPair& pair,
+                      const platform::Config& config) {
+  if (!config.auth_cookie_mode) return;
+  res.set_header("Set-Cookie",
+                 make_cookie("aip_access", pair.access_token, pair.expires_in, "/",
+                             config.auth_cookie_secure));
+  res.set_header("Set-Cookie",
+                 make_cookie("aip_refresh", pair.refresh_token,
+                             config.jwt_refresh_ttl_s, "/v1/auth",
+                             config.auth_cookie_secure));
+}
+
+void clear_auth_cookies(httplib::Response& res, const platform::Config& config) {
+  if (!config.auth_cookie_mode) return;
+  res.set_header("Set-Cookie",
+                 make_cookie("aip_access", "", 0, "/", config.auth_cookie_secure));
+  res.set_header("Set-Cookie",
+                 make_cookie("aip_refresh", "", 0, "/v1/auth",
+                             config.auth_cookie_secure));
+}
+
+void send_auth_ok(httplib::Response& res, const auth::TokenPair& pair,
+                  const platform::Config& config) {
+  res.set_content(auth_response_json(pair, config.auth_cookie_mode).dump(),
+                  "application/json; charset=utf-8");
+  set_auth_cookies(res, pair, config);
+}
+
 // 内置 Web UI：资源编译进二进制，只按 URL 精确查表，不接触文件系统。
 void send_asset(httplib::Response& res, const web::Asset& asset) {
   res.set_content(std::string(asset.content), std::string(asset.content_type));
@@ -284,7 +312,18 @@ void ApiServer::Impl::setup_routes() {
         if (!config.auth_enabled() || is_public_path(config, req.path)) {
           return httplib::Server::HandlerResponse::Unhandled;
         }
-        const auto token = bearer_token(req.get_header_value("Authorization"));
+        auto token = bearer_token(req.get_header_value("Authorization"));
+        bool from_cookie = false;
+        if (!token.has_value() && config.auth_cookie_mode) {
+          token = cookie_value(req.get_header_value("Cookie"), "aip_access");
+          from_cookie = token.has_value();
+        }
+        if (from_cookie && req.method != "GET" && req.method != "HEAD" &&
+            req.method != "OPTIONS" &&
+            !same_origin(req.get_header_value("Origin"), config.public_base_url)) {
+          deny(403, "csrf_failed", "Cookie 模式下的写请求必须来自同源页面", "csrf_failed");
+          return httplib::Server::HandlerResponse::Handled;
+        }
         if (token.has_value() && !config.api_token.empty() &&
             token_equals(*token, config.api_token)) {
           return httplib::Server::HandlerResponse::Unhandled;
@@ -545,7 +584,10 @@ auth::Principal ApiServer::Impl::principal_from(const httplib::Request& req) con
     return remember();
   }
 
-  const auto token = bearer_token(req.get_header_value("Authorization"));
+  auto token = bearer_token(req.get_header_value("Authorization"));
+  if (!token.has_value() && config.auth_cookie_mode) {
+    token = cookie_value(req.get_header_value("Cookie"), "aip_access");
+  }
   if (!token.has_value()) return remember();
 
   if (!config.api_token.empty() && token_equals(*token, config.api_token)) {
@@ -980,8 +1022,7 @@ void ApiServer::Impl::handle_auth_register(const httplib::Request& req,
       res.set_content(register_outcome_json(outcome).dump(),
                       "application/json; charset=utf-8");
     } else {
-      res.set_content(token_pair_json(outcome.tokens).dump(),
-                      "application/json; charset=utf-8");
+      send_auth_ok(res, outcome.tokens, config);
     }
   } catch (const auth::AuthError& e) {
     send_auth_error(res, e);
@@ -1014,7 +1055,7 @@ void ApiServer::Impl::handle_auth_login(const httplib::Request& req, httplib::Re
     const auth::TokenPair pair = auth->login(body["email"].get<std::string>(),
                                              body["password"].get<std::string>(),
                                              client_ip(req));
-    res.set_content(token_pair_json(pair).dump(), "application/json; charset=utf-8");
+    send_auth_ok(res, pair, config);
   } catch (const auth::AuthError& e) {
     send_auth_error(res, e);
   }
@@ -1040,7 +1081,11 @@ void ApiServer::Impl::handle_auth_refresh(const httplib::Request& req, httplib::
   const auto header_token = bearer_token(req.get_header_value("Authorization"));
   if (header_token.has_value()) {
     refresh_token = *header_token;
-  } else {
+  } else if (config.auth_cookie_mode) {
+    const auto cookie = cookie_value(req.get_header_value("Cookie"), "aip_refresh");
+    if (cookie.has_value()) refresh_token = *cookie;
+  }
+  if (refresh_token.empty()) {
     json body;
     if (!parse_auth_json(req, body, res)) return;
     if (!body.contains("refresh_token") || !body["refresh_token"].is_string()) {
@@ -1051,8 +1096,8 @@ void ApiServer::Impl::handle_auth_refresh(const httplib::Request& req, httplib::
   }
 
   try {
-    const auth::TokenPair pair = auth->refresh(refresh_token);
-    res.set_content(token_pair_json(pair).dump(), "application/json; charset=utf-8");
+    const auth::TokenPair pair = auth->refresh(refresh_token, client_ip(req));
+    send_auth_ok(res, pair, config);
   } catch (const auth::AuthError& e) {
     send_auth_error(res, e);
   }
@@ -1079,7 +1124,11 @@ void ApiServer::Impl::handle_auth_logout(const httplib::Request& req,
   const auto header = bearer_token(req.get_header_value("Authorization"));
   if (header.has_value()) {
     refresh_token = *header;
-  } else if (!req.body.empty()) {
+  } else if (config.auth_cookie_mode) {
+    const auto cookie = cookie_value(req.get_header_value("Cookie"), "aip_refresh");
+    if (cookie.has_value()) refresh_token = *cookie;
+  }
+  if (refresh_token.empty() && !req.body.empty()) {
     json body;
     if (!parse_auth_json(req, body, res)) return;
     if (body.contains("refresh_token") && body["refresh_token"].is_string()) {
@@ -1088,6 +1137,7 @@ void ApiServer::Impl::handle_auth_logout(const httplib::Request& req,
   }
   auth->logout(refresh_token);
   res.set_content(json{{"logged_out", true}}.dump(), "application/json; charset=utf-8");
+  clear_auth_cookies(res, config);
 }
 
 void ApiServer::Impl::handle_auth_verify_email(const httplib::Request& req,
@@ -1104,7 +1154,7 @@ void ApiServer::Impl::handle_auth_verify_email(const httplib::Request& req,
   try {
     const auth::TokenPair pair =
         auth->verify_email(body["token"].get<std::string>(), client_ip(req));
-    res.set_content(token_pair_json(pair).dump(), "application/json; charset=utf-8");
+    send_auth_ok(res, pair, config);
   } catch (const auth::AuthError& e) {
     send_auth_error(res, e);
   }
@@ -1204,7 +1254,7 @@ void ApiServer::Impl::handle_auth_password_change(const httplib::Request& req,
     const auth::TokenPair pair =
         auth->change_password(principal, body["old_password"].get<std::string>(),
                               body["new_password"].get<std::string>());
-    res.set_content(token_pair_json(pair).dump(), "application/json; charset=utf-8");
+    send_auth_ok(res, pair, config);
   } catch (const auth::AuthError& e) {
     send_auth_error(res, e);
   }

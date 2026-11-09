@@ -36,8 +36,10 @@ M2 的 JWT 是无状态的：refresh token 不能单条吊销，改密后旧 tok
 7. **邮件发送**
    - `EmailSender` 接口；生产用 `smtp://`/`smtps://`（libcurl），未配置时用日志发送器。
    - 邮件链接指向内置 `/account.html?mode=verify|reset&token=...` 落地页。
-8. **不引入**：httpOnly cookie/BFF、MFA、OIDC/SSO。前端 token 仍存 localStorage，
-   生产建议由 BFF 或网关层补 CSRF/HttpOnly；这属于部署形态决策，未在本次强行改造。
+8. **可选 httpOnly Cookie 模式**：`AIP_AUTH_COOKIE_MODE=1` 时 token 写入
+   `aip_access`/`aip_refresh`（HttpOnly、SameSite=Strict），响应体不返回 token；
+   写请求校验同源 `Origin` 防 CSRF。默认关闭，保留 Bearer + localStorage 给
+   API 客户端/演示。BFF、MFA、OIDC/SSO 仍不在本次范围。
 
 ## 后果
 
@@ -56,7 +58,8 @@ M2 的 JWT 是无状态的：refresh token 不能单条吊销，改密后旧 tok
   长期需要定时归档/删除任务；
 - API Key 不随 token_version 失效（它是独立的显式凭据）；如需“改密吊销所有凭据”，
   要额外吊销 api_keys；
-- 管理员禁用用户仍只有数据库字段，没有 admin API/页面（P1 管理后台）。
+- 管理员禁用用户仍只有数据库字段，没有 admin API/页面（P1 管理后台）；
+- Cookie 模式的 CSRF 防护是 Origin 白名单，不是双提交 token；BFF 场景仍建议网关层补 CSRF。
 
 ## 验收记录（2026-11-09）
 

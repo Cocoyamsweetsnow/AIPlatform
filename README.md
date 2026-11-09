@@ -27,7 +27,7 @@
 - ✅ **PostgreSQL 持久化（M1）**：`AIP_STORAGE=postgres` 时会话/消息落库，重启不丢；
   迁移自动执行、连接池、软删除、按用户隔离的会话归属
 - ✅ 鉴权：静态 `AIP_TOKEN`（admin）/ JWT（HS256，access 15m + refresh 7d）/ API Key（SHA-256 哈希、可撤销）
-- ✅ 账号安全：refresh 轮换与吊销、改密踢下线、邮箱验证、找回密码、登录/注册限流、恒定时间假哈希
+- ✅ 账号安全：refresh 轮换与吊销、改密踢下线、邮箱验证、找回密码、登录/注册限流、恒定时间假哈希、可选 httpOnly Cookie 模式
 - ✅ 多租户会话归属：普通用户只能访问自己的会话；admin 可访问全部
 - ✅ 配额限流：每用户 RPM / 并发流 / 每日 token；超出返回 429 + `Retry-After`
 - ✅ 多副本配额（PostgreSQL 原子预留/lease）、usage 异步可靠写
@@ -233,6 +233,7 @@ AIP_WEB=false ./build/aiplatform
   "auth": {
     "user_accounts": false, "password_login": false, "registration": false,
     "static_token": false, "email_verification_required": false,
+    "cookie_mode": false, "cookie_secure": false,
     "password_reset": true, "refresh_rotation": true,
     "access_ttl_s": 900, "refresh_ttl_s": 604800
   },
@@ -292,8 +293,12 @@ AIP_WEB=false ./build/aiplatform
 - **枚举防护**：登录时用户不存在也执行一次 Argon2 假哈希；找回密码对不存在的邮箱
   也返回 202。
 - **邮件配置**：生产设置 `AIP_SMTP_URL`；未配置时验证/重置链接只写日志，仅适合本地。
-- **Web 端**：token 仍存 `localStorage`（演示级）。生产建议改用 httpOnly cookie + BFF，
-  或在 Nginx/BFF 层做 CSRF 防护；`/v1/config` 的 `auth` 字段会告诉前端是否开启验证/重置。
+- **httpOnly Cookie 模式（可选）**：`AIP_AUTH_COOKIE_MODE=1` 时登录/刷新把
+  `aip_access`/`aip_refresh` 写进 httpOnly + SameSite=Strict Cookie，响应体不再返回
+  token；写请求必须带同源 `Origin`（CSRF 校验），前端自动使用 `credentials: same-origin`。
+  生产还需 `AIP_AUTH_COOKIE_SECURE=1`（HTTPS）并把 `AIP_PUBLIC_BASE_URL` 配成同源地址。
+- 默认仍是 Bearer + `localStorage`（演示级）。生产建议 Cookie 模式或 BFF；
+  `/v1/config` 的 `auth` 字段会告诉前端当前模式。
 
 ### `POST /v1/chat/completions`
 
@@ -488,18 +493,22 @@ src/
 │   ├── password_hasher.*     Argon2id
 │   ├── jwt.*                 HS256 JWT（access/refresh）
 │   ├── api_key.*             API Key 生成/哈希/常量时间比较
-│   ├── auth_service.*        注册/登录/刷新/Bearer 解析/API Key 管理
+│   ├── auth_service.*        注册/登录/刷新/改密/邮箱验证/找回密码
+│   ├── email_sender.*        SMTP / 日志邮件发送
+│   ├── rate_limiter.*        PostgreSQL 固定窗口限流
 │   ├── user_store.h          用户存储接口
 │   ├── pg_user_store.*       PostgreSQL 实现
-│   └── errors.h              AuthError（400/401/403/409）
+│   └── errors.h              AuthError（400/401/403/429/503）
 ├── storage/                  PostgreSQL 基础设施
 │   ├── db.{h,cpp}            连接池 / Lease / Transaction / Result
 │   └── migrations.{h,cpp}    版本化迁移 + advisory lock
-├── quota/                    进程内配额（RPM / 并发 / 每日 token）
-│   └── quota.{h,cpp}         QuotaService + RAII QuotaGuard
+├── quota/                    配额（RPM / 并发 / 每日 token）
+│   ├── quota.{h,cpp}         进程内 QuotaService + RAII QuotaGuard
+│   └── pg_quota.*            PostgreSQL 原子预留/lease（多副本）
 ├── usage/                    用量流水
 │   ├── usage.h               UsageSink 接口
-│   └── pg_usage_sink.*       PostgreSQL 实现 + 当天汇总
+│   ├── pg_usage_sink.*       PostgreSQL 实现 + 当天汇总
+│   └── async_usage_sink.*    有界队列 + 重试 + flush
 ├── chat/                     业务层（上下文、会话存储）
 │   ├── session_store.{h,cpp} SessionStore 接口 + 内存 LRU 实现
 │   ├── pg_session_store.*    PostgreSQL 实现
@@ -542,17 +551,21 @@ Drogon 用 reactor，**连接本身不占线程**：实测 300 路挂起连接�
 
 ## 下一步
 
-P0 生产化按 M1~M5 拆分，现已全部落地：M1 持久化、M2 用户/JWT/API Key/归属、
-M3 配额限流/usage 流水、M4 请求幂等/会话管理、M5 token 预算上下文。见
-[adr/0002](docs/adr/0002-postgresql-persistence.md)、[adr/0003](docs/adr/0003-auth.md)、
-[adr/0004](docs/adr/0004-quota-usage.md)、[adr/0005](docs/adr/0005-idempotency-sessions.md)、
-[adr/0006](docs/adr/0006-context-budget.md)。
+P0 生产化按 M1~M6 拆分，现已全部落地：
 
-下一阶段是 roadmap 的阶段 6/7：可观测性（metrics/结构化日志）、正式压测、部署、
-RAG/工具调用/本地推理。
+- M1 持久化（[adr/0002](docs/adr/0002-postgresql-persistence.md)）
+- M2 用户/JWT/API Key/归属（[adr/0003](docs/adr/0003-auth.md)）
+- M3 配额限流/usage 流水（[adr/0004](docs/adr/0004-quota-usage.md)）
+- M4 请求幂等/会话管理（[adr/0005](docs/adr/0005-idempotency-sessions.md)）
+- M5 token 预算上下文（[adr/0006](docs/adr/0006-context-budget.md)）
+- M6 可观测性 + 账号安全 + 多副本配额 + OpenAI 兼容 + Key 治理
+  （[adr/0007](docs/adr/0007-account-security.md)、
+  [adr/0008](docs/adr/0008-distributed-quota.md)）
 
-更完整的长期路线（可观测性、压测、RAG / 工具调用 / 本地推理）见
-[docs/ROADMAP.md](docs/ROADMAP.md)。
+下一阶段是 P1 产品化：会话云端同步/自动标题/分享导出、模型选择与成本报表、
+附件/多模态、管理后台，以及 roadmap 阶段 7 的 RAG/工具调用/本地推理。
+
+更完整的长期路线见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 内置单页已经覆盖「演示 + 联调」；生产前端是否复用 Open WebUI / 自研 Next.js，
 仍按 [docs/DECISIONS.md](docs/DECISIONS.md) 的 D6 由人拍板。

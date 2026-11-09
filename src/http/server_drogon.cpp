@@ -99,6 +99,40 @@ HttpResponsePtr body_response(std::string body, const std::string& content_type)
   return resp;
 }
 
+void add_cookie(const HttpResponsePtr& resp, const std::string& name,
+                const std::string& value, int max_age_s, const std::string& path,
+                bool secure) {
+  drogon::Cookie cookie(name, value);
+  cookie.setHttpOnly(true);
+  cookie.setSecure(secure);
+  cookie.setPath(path);
+  cookie.setMaxAge(max_age_s);
+  cookie.setSameSite(drogon::Cookie::SameSite::kStrict);
+  resp->addCookie(std::move(cookie));
+}
+
+void set_auth_cookies(const HttpResponsePtr& resp, const auth::TokenPair& pair,
+                      const platform::Config& config) {
+  if (!config.auth_cookie_mode) return;
+  add_cookie(resp, "aip_access", pair.access_token, pair.expires_in, "/",
+             config.auth_cookie_secure);
+  add_cookie(resp, "aip_refresh", pair.refresh_token, config.jwt_refresh_ttl_s,
+             "/v1/auth", config.auth_cookie_secure);
+}
+
+void clear_auth_cookies(const HttpResponsePtr& resp, const platform::Config& config) {
+  if (!config.auth_cookie_mode) return;
+  add_cookie(resp, "aip_access", "", 0, "/", config.auth_cookie_secure);
+  add_cookie(resp, "aip_refresh", "", 0, "/v1/auth", config.auth_cookie_secure);
+}
+
+HttpResponsePtr auth_ok_response(const auth::TokenPair& pair,
+                                 const platform::Config& config) {
+  auto resp = json_ok(auth_response_json(pair, config.auth_cookie_mode));
+  set_auth_cookies(resp, pair, config);
+  return resp;
+}
+
 // 内置 Web UI：资源已经编译进二进制，这里只按 URL 精确查表。
 // 不接触文件系统，因此不需要担心目录穿越；文档根目录仍然保持禁用。
 HttpResponsePtr asset_response(const web::Asset& asset) {
@@ -955,10 +989,25 @@ void ApiServer::Impl::pre_routing(const HttpRequestPtr& req, drogon::AdviceCallb
     callback(error_response(status, type, message));
   };
 
-  const auto token = bearer_token(req->getHeader("authorization"));
+  auto token = bearer_token(req->getHeader("authorization"));
+  bool from_cookie = false;
+  if (!token.has_value() && config.auth_cookie_mode) {
+    const std::string& cookie_token = req->getCookie("aip_access");
+    if (!cookie_token.empty()) {
+      token = cookie_token;
+      from_cookie = true;
+    }
+  }
   if (!token.has_value()) {
     deny(drogon::k401Unauthorized, "unauthorized", "缺少 Authorization: Bearer <token>",
          "missing_token");
+    return;
+  }
+  if (from_cookie && req->method() != drogon::Get && req->method() != drogon::Head &&
+      req->method() != drogon::Options &&
+      !same_origin(req->getHeader("origin"), config.public_base_url)) {
+    deny(drogon::k403Forbidden, "csrf_failed", "Cookie 模式下的写请求必须来自同源页面",
+         "csrf_failed");
     return;
   }
 
@@ -1846,7 +1895,7 @@ void ApiServer::Impl::handle_auth_register(const HttpRequestPtr& req,
         resp->setStatusCode(drogon::k201Created);
         post(shared_callback, std::move(resp));
       } else {
-        post(shared_callback, json_ok(token_pair_json(outcome.tokens)));
+        post(shared_callback, auth_ok_response(outcome.tokens, config));
       }
     } catch (const auth::AuthError& e) {
       post_auth_error(shared_callback, e);
@@ -1900,7 +1949,7 @@ void ApiServer::Impl::handle_auth_login(const HttpRequestPtr& req, ResponseCallb
   const bool queued = db_workers.submit([this, email, password, ip, shared_callback] {
     try {
       const auth::TokenPair pair = auth_->login(email, password, ip);
-      post(shared_callback, json_ok(token_pair_json(pair)));
+      post(shared_callback, auth_ok_response(pair, config));
     } catch (const auth::AuthError& e) {
       post_auth_error(shared_callback, e);
     }
@@ -1936,7 +1985,11 @@ void ApiServer::Impl::handle_auth_refresh(const HttpRequestPtr& req,
   const auto header_token = bearer_token(req->getHeader("authorization"));
   if (header_token.has_value()) {
     refresh_token = *header_token;
-  } else {
+  } else if (config.auth_cookie_mode) {
+    const std::string& cookie = req->getCookie("aip_refresh");
+    if (!cookie.empty()) refresh_token = cookie;
+  }
+  if (refresh_token.empty()) {
     json body;
     try {
       body = json::parse(std::string(req->body()));
@@ -1958,7 +2011,7 @@ void ApiServer::Impl::handle_auth_refresh(const HttpRequestPtr& req,
   const bool queued = db_workers.submit([this, refresh_token, ip, shared_callback] {
     try {
       const auth::TokenPair pair = auth_->refresh(refresh_token, ip);
-      post(shared_callback, json_ok(token_pair_json(pair)));
+      post(shared_callback, auth_ok_response(pair, config));
     } catch (const auth::AuthError& e) {
       post_auth_error(shared_callback, e);
     }
@@ -1994,7 +2047,11 @@ void ApiServer::Impl::handle_auth_logout(const HttpRequestPtr& req,
   std::string refresh_token;
   if (const auto header = bearer_token(req->getHeader("authorization")); header.has_value()) {
     refresh_token = *header;
-  } else if (!req->body().empty()) {
+  } else if (config.auth_cookie_mode) {
+    const std::string& cookie = req->getCookie("aip_refresh");
+    if (!cookie.empty()) refresh_token = cookie;
+  }
+  if (refresh_token.empty() && !req->body().empty()) {
     json body;
     try {
       body = json::parse(std::string(req->body()));
@@ -2011,7 +2068,9 @@ void ApiServer::Impl::handle_auth_logout(const HttpRequestPtr& req,
   auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
   const bool queued = db_workers.submit([this, refresh_token, shared_callback] {
     auth_->logout(refresh_token);
-    post(shared_callback, json_ok({{"logged_out", true}}));
+    auto resp = json_ok({{"logged_out", true}});
+    clear_auth_cookies(resp, config);
+    post(shared_callback, std::move(resp));
   });
   if (!queued) {
     (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
@@ -2043,7 +2102,7 @@ void ApiServer::Impl::handle_auth_verify_email(const HttpRequestPtr& req,
   const bool queued = db_workers.submit([this, token, ip, shared_callback] {
     try {
       const auth::TokenPair pair = auth_->verify_email(token, ip);
-      post(shared_callback, json_ok(token_pair_json(pair)));
+      post(shared_callback, auth_ok_response(pair, config));
     } catch (const auth::AuthError& e) {
       post_auth_error(shared_callback, e);
     }
@@ -2203,7 +2262,7 @@ void ApiServer::Impl::handle_auth_password_change(const HttpRequestPtr& req,
         try {
           const auth::TokenPair pair =
               auth_->change_password(principal, old_password, new_password);
-          post(shared_callback, json_ok(token_pair_json(pair)));
+          post(shared_callback, auth_ok_response(pair, config));
         } catch (const auth::AuthError& e) {
           post_auth_error(shared_callback, e);
         }

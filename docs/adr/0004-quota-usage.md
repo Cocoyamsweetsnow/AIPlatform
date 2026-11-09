@@ -5,6 +5,10 @@
 - 决策者：项目负责人（AI 按 roadmap 阶段 4 实施）
 - 影响范围：`src/quota/`、`src/usage/`、`src/chat/`、`src/http/`、`src/main.cpp`、`src/config.*`、`CMakeLists.txt`
 
+> **2026-11-09 更新（P0）**：本文的“进程内限流 / 每日 token 先查后写 / usage 同步写”
+> 已在 [0008-distributed-quota.md](0008-distributed-quota.md) 补齐：PostgreSQL 原子预留、
+> 并发 lease、异步 usage sink。本文保留为 M3 的历史决策记录。
+
 ## 背景
 
 M2 之后每个请求都有 `user_id`，但还没有任何成本/滥用控制：一个用户可以在
