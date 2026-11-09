@@ -10,6 +10,7 @@
 
 #include "auth/api_key.h"
 #include "auth/errors.h"
+#include "auth/rate_limiter.h"
 #include "common/log.h"
 
 namespace auth {

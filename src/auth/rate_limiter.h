@@ -4,10 +4,7 @@
 // 不必为这个功能额外引入 Redis。频率不高，一次 UPSERT 足够。
 #pragma once
 
-#include <atomic>
 #include <string>
-
-#include "storage/db.h"
 
 namespace auth {
 
@@ -21,17 +18,6 @@ class RateLimiter {
   virtual ~RateLimiter() = default;
   /// limit <= 0 表示不限；window_s 建议 60。
   virtual RateLimitDecision check(const std::string& bucket, int limit, int window_s) = 0;
-};
-
-class PgRateLimiter final : public RateLimiter {
- public:
-  explicit PgRateLimiter(storage::DbPool& db) : db_(db) {}
-
-  RateLimitDecision check(const std::string& bucket, int limit, int window_s) override;
-
- private:
-  storage::DbPool& db_;
-  std::atomic<int> calls_{0};
 };
 
 }  // namespace auth

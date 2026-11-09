@@ -24,7 +24,7 @@
 #endif
 #if defined(AIP_WITH_AUTH) && defined(AIP_WITH_POSTGRES)
 #include "auth/pg_user_store.h"
-#include "auth/rate_limiter.h"
+#include "auth/pg_rate_limiter.h"
 #endif
 #ifdef AIP_WITH_POSTGRES
 #include "chat/pg_idempotency_store.h"

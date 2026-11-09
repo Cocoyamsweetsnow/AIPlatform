@@ -17,11 +17,12 @@
 #include "auth/jwt.h"
 #include "auth/password_hasher.h"
 #include "auth/principal.h"
-#include "auth/rate_limiter.h"
 #include "auth/types.h"
 #include "auth/user_store.h"
 
 namespace auth {
+
+class RateLimiter;
 
 struct AuthConfig {
   std::string static_token;  // AIP_TOKEN；为空表示不启用静态管理员 Token

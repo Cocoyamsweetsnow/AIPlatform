@@ -18,7 +18,7 @@
 #include "auth/auth_service.h"
 #include "auth/errors.h"
 #include "auth/pg_user_store.h"
-#include "auth/rate_limiter.h"
+#include "auth/pg_rate_limiter.h"
 #endif
 
 namespace {
