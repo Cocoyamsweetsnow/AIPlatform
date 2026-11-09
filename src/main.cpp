@@ -62,6 +62,8 @@ int main() {
     constexpr const char* kHttpBackend = "httplib";
 #endif
     metrics::set_build_info(AIP_VERSION, kHttpBackend, config.provider);
+    metrics::set_active_streams(0);
+    metrics::set_ready(false);
 
     std::unique_ptr<llm::Provider> provider;
     if (config.provider == "openai") {
