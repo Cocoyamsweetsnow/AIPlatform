@@ -154,7 +154,9 @@ bool is_public_path(const platform::Config& config, const std::string& path) {
     return true;
   }
   if (path == "/v1/auth/register" || path == "/v1/auth/login" ||
-      path == "/v1/auth/refresh") {
+      path == "/v1/auth/refresh" || path == "/v1/auth/logout" ||
+      path == "/v1/auth/verify-email" || path == "/v1/auth/password/forgot" ||
+      path == "/v1/auth/password/reset") {
     return true;
   }
   return config.web_enabled && web::is_public_asset(path);
@@ -222,6 +224,7 @@ struct ApiServer::Impl {
 
   void setup_routes();
   auth::Principal principal_from(const httplib::Request& req) const;
+  std::string client_ip(const httplib::Request& req) const;
   void handle_chat(const httplib::Request& req, httplib::Response& res);
   void handle_history(const httplib::Request& req, httplib::Response& res);
   void handle_sessions_list(const httplib::Request& req, httplib::Response& res);
@@ -230,6 +233,11 @@ struct ApiServer::Impl {
   void handle_auth_register(const httplib::Request& req, httplib::Response& res);
   void handle_auth_login(const httplib::Request& req, httplib::Response& res);
   void handle_auth_refresh(const httplib::Request& req, httplib::Response& res);
+  void handle_auth_logout(const httplib::Request& req, httplib::Response& res);
+  void handle_auth_verify_email(const httplib::Request& req, httplib::Response& res);
+  void handle_auth_password_forgot(const httplib::Request& req, httplib::Response& res);
+  void handle_auth_password_reset(const httplib::Request& req, httplib::Response& res);
+  void handle_auth_password_change(const httplib::Request& req, httplib::Response& res);
   void handle_auth_me(const httplib::Request& req, httplib::Response& res);
   void handle_auth_list_api_keys(const httplib::Request& req, httplib::Response& res);
   void handle_auth_create_api_key(const httplib::Request& req, httplib::Response& res);
@@ -404,6 +412,25 @@ void ApiServer::Impl::setup_routes() {
   server.Post("/v1/auth/refresh", [this](const httplib::Request& req, httplib::Response& res) {
     handle_auth_refresh(req, res);
   });
+  server.Post("/v1/auth/logout", [this](const httplib::Request& req, httplib::Response& res) {
+    handle_auth_logout(req, res);
+  });
+  server.Post("/v1/auth/verify-email",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                handle_auth_verify_email(req, res);
+              });
+  server.Post("/v1/auth/password/forgot",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                handle_auth_password_forgot(req, res);
+              });
+  server.Post("/v1/auth/password/reset",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                handle_auth_password_reset(req, res);
+              });
+  server.Post("/v1/auth/password/change",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                handle_auth_password_change(req, res);
+              });
   server.Get("/v1/auth/me", [this](const httplib::Request& req, httplib::Response& res) {
     handle_auth_me(req, res);
   });
@@ -536,6 +563,22 @@ auth::Principal ApiServer::Impl::principal_from(const httplib::Request& req) con
   }
 #endif
   return remember();
+}
+
+std::string ApiServer::Impl::client_ip(const httplib::Request& req) const {
+  if (config.trust_proxy) {
+    std::string forwarded = req.get_header_value("X-Forwarded-For");
+    if (!forwarded.empty()) {
+      const std::size_t comma = forwarded.find(',');
+      if (comma != std::string::npos) forwarded.resize(comma);
+      const auto begin = forwarded.find_first_not_of(" \t");
+      const auto end = forwarded.find_last_not_of(" \t");
+      if (begin != std::string::npos) {
+        return forwarded.substr(begin, end - begin + 1);
+      }
+    }
+  }
+  return req.remote_addr;
 }
 
 void ApiServer::Impl::handle_chat(const httplib::Request& req, httplib::Response& res) {
@@ -902,6 +945,9 @@ bool parse_auth_json(const httplib::Request& req, nlohmann::json& body,
 void send_auth_error(httplib::Response& res, const auth::AuthError& error) {
   const AuthHttpError info = auth_http_error(error.code());
   send_error(res, info.status, info.type, error.what());
+  if (error.retry_after_s() > 0) {
+    res.set_header("Retry-After", std::to_string(error.retry_after_s()));
+  }
 }
 
 }  // namespace
@@ -923,10 +969,18 @@ void ApiServer::Impl::handle_auth_register(const httplib::Request& req,
   }
 
   try {
-    const auth::TokenPair pair = auth->register_user(
+    const auth::RegisterOutcome outcome = auth->register_user(
         body["email"].get<std::string>(), body["password"].get<std::string>(),
-        body.contains("display_name") ? body["display_name"].get<std::string>() : std::string{});
-    res.set_content(token_pair_json(pair).dump(), "application/json; charset=utf-8");
+        body.contains("display_name") ? body["display_name"].get<std::string>() : std::string{},
+        client_ip(req));
+    if (outcome.verification_required) {
+      res.status = 201;
+      res.set_content(register_outcome_json(outcome).dump(),
+                      "application/json; charset=utf-8");
+    } else {
+      res.set_content(token_pair_json(outcome.tokens).dump(),
+                      "application/json; charset=utf-8");
+    }
   } catch (const auth::AuthError& e) {
     send_auth_error(res, e);
   }
@@ -956,7 +1010,8 @@ void ApiServer::Impl::handle_auth_login(const httplib::Request& req, httplib::Re
 
   try {
     const auth::TokenPair pair = auth->login(body["email"].get<std::string>(),
-                                             body["password"].get<std::string>());
+                                             body["password"].get<std::string>(),
+                                             client_ip(req));
     res.set_content(token_pair_json(pair).dump(), "application/json; charset=utf-8");
   } catch (const auth::AuthError& e) {
     send_auth_error(res, e);
@@ -1008,6 +1063,158 @@ void ApiServer::Impl::handle_auth_refresh(const httplib::Request& req, httplib::
   catch (const std::exception& e) {
     platform::log_error(std::string("刷新 token 失败: ") + e.what());
     send_error(res, 500, "internal_error", "刷新 token 失败");
+  }
+}
+
+
+void ApiServer::Impl::handle_auth_logout(const httplib::Request& req,
+                                         httplib::Response& res) {
+  if (auth == nullptr) {
+    return send_error(res, 503, "auth_unavailable",
+                      "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）");
+  }
+  std::string refresh_token;
+  const auto header = bearer_token(req.get_header_value("Authorization"));
+  if (header.has_value()) {
+    refresh_token = *header;
+  } else if (!req.body.empty()) {
+    json body;
+    if (!parse_auth_json(req, body, res)) return;
+    if (body.contains("refresh_token") && body["refresh_token"].is_string()) {
+      refresh_token = body["refresh_token"].get<std::string>();
+    }
+  }
+  auth->logout(refresh_token);
+  res.set_content(json{{"logged_out", true}}.dump(), "application/json; charset=utf-8");
+}
+
+void ApiServer::Impl::handle_auth_verify_email(const httplib::Request& req,
+                                               httplib::Response& res) {
+  if (auth == nullptr) {
+    return send_error(res, 503, "auth_unavailable",
+                      "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）");
+  }
+  json body;
+  if (!parse_auth_json(req, body, res)) return;
+  if (!body.contains("token") || !body["token"].is_string()) {
+    return send_error(res, 400, "invalid_request", "token 必须是字符串");
+  }
+  try {
+    const auth::TokenPair pair =
+        auth->verify_email(body["token"].get<std::string>(), client_ip(req));
+    res.set_content(token_pair_json(pair).dump(), "application/json; charset=utf-8");
+  } catch (const auth::AuthError& e) {
+    send_auth_error(res, e);
+  }
+#ifdef AIP_WITH_POSTGRES
+  catch (const storage::DbError& e) {
+    platform::log_error(std::string("验证邮箱失败（存储）: ") + e.what());
+    send_error(res, 503, "storage_unavailable", "用户存储暂时不可用，请稍后重试");
+  }
+#endif
+  catch (const std::exception& e) {
+    platform::log_error(std::string("验证邮箱失败: ") + e.what());
+    send_error(res, 500, "internal_error", "验证邮箱失败");
+  }
+}
+
+void ApiServer::Impl::handle_auth_password_forgot(const httplib::Request& req,
+                                                  httplib::Response& res) {
+  if (auth == nullptr) {
+    return send_error(res, 503, "auth_unavailable",
+                      "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）");
+  }
+  json body;
+  if (!parse_auth_json(req, body, res)) return;
+  if (!body.contains("email") || !body["email"].is_string()) {
+    return send_error(res, 400, "invalid_request", "email 必须是字符串");
+  }
+  try {
+    auth->request_password_reset(body["email"].get<std::string>(), client_ip(req));
+    res.status = 202;
+    res.set_content(
+        json{{"message", "如果该邮箱已注册，重置邮件已发送"}}.dump(),
+        "application/json; charset=utf-8");
+  } catch (const auth::AuthError& e) {
+    send_auth_error(res, e);
+  }
+#ifdef AIP_WITH_POSTGRES
+  catch (const storage::DbError& e) {
+    platform::log_error(std::string("发送重置邮件失败（存储）: ") + e.what());
+    send_error(res, 503, "storage_unavailable", "用户存储暂时不可用，请稍后重试");
+  }
+#endif
+  catch (const std::exception& e) {
+    platform::log_error(std::string("发送重置邮件失败: ") + e.what());
+    send_error(res, 500, "internal_error", "发送重置邮件失败");
+  }
+}
+
+void ApiServer::Impl::handle_auth_password_reset(const httplib::Request& req,
+                                                 httplib::Response& res) {
+  if (auth == nullptr) {
+    return send_error(res, 503, "auth_unavailable",
+                      "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）");
+  }
+  json body;
+  if (!parse_auth_json(req, body, res)) return;
+  if (!body.contains("token") || !body["token"].is_string() ||
+      !body.contains("new_password") || !body["new_password"].is_string()) {
+    return send_error(res, 400, "invalid_request", "token 和 new_password 必须是字符串");
+  }
+  try {
+    auth->reset_password(body["token"].get<std::string>(),
+                         body["new_password"].get<std::string>(), client_ip(req));
+    res.set_content(json{{"reset", true}}.dump(), "application/json; charset=utf-8");
+  } catch (const auth::AuthError& e) {
+    send_auth_error(res, e);
+  }
+#ifdef AIP_WITH_POSTGRES
+  catch (const storage::DbError& e) {
+    platform::log_error(std::string("重置密码失败（存储）: ") + e.what());
+    send_error(res, 503, "storage_unavailable", "用户存储暂时不可用，请稍后重试");
+  }
+#endif
+  catch (const std::exception& e) {
+    platform::log_error(std::string("重置密码失败: ") + e.what());
+    send_error(res, 500, "internal_error", "重置密码失败");
+  }
+}
+
+void ApiServer::Impl::handle_auth_password_change(const httplib::Request& req,
+                                                  httplib::Response& res) {
+  if (auth == nullptr) {
+    return send_error(res, 503, "auth_unavailable",
+                      "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）");
+  }
+  const auth::Principal principal = principal_from(req);
+  if (principal.user_id <= 0) {
+    return send_error(res, 401, "unauthorized", "该接口需要用户身份（JWT/API Key）");
+  }
+  json body;
+  if (!parse_auth_json(req, body, res)) return;
+  if (!body.contains("old_password") || !body["old_password"].is_string() ||
+      !body.contains("new_password") || !body["new_password"].is_string()) {
+    return send_error(res, 400, "invalid_request",
+                      "old_password 和 new_password 必须是字符串");
+  }
+  try {
+    const auth::TokenPair pair =
+        auth->change_password(principal, body["old_password"].get<std::string>(),
+                              body["new_password"].get<std::string>());
+    res.set_content(token_pair_json(pair).dump(), "application/json; charset=utf-8");
+  } catch (const auth::AuthError& e) {
+    send_auth_error(res, e);
+  }
+#ifdef AIP_WITH_POSTGRES
+  catch (const storage::DbError& e) {
+    platform::log_error(std::string("修改密码失败（存储）: ") + e.what());
+    send_error(res, 503, "storage_unavailable", "用户存储暂时不可用，请稍后重试");
+  }
+#endif
+  catch (const std::exception& e) {
+    platform::log_error(std::string("修改密码失败: ") + e.what());
+    send_error(res, 500, "internal_error", "修改密码失败");
   }
 }
 

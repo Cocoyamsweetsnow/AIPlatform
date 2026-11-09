@@ -23,7 +23,8 @@ inline nlohmann::json user_json(const auth::User& user) {
   return nlohmann::json{{"id", user.id},
                         {"email", user.email},
                         {"display_name", user.display_name},
-                        {"role", user.role}};
+                        {"role", user.role},
+                        {"email_verified", user.email_verified}};
 }
 
 inline nlohmann::json token_pair_json(const auth::TokenPair& pair) {
@@ -32,6 +33,15 @@ inline nlohmann::json token_pair_json(const auth::TokenPair& pair) {
                         {"refresh_token", pair.refresh_token},
                         {"expires_in", pair.expires_in},
                         {"user", user_json(pair.user)}};
+}
+
+inline nlohmann::json register_outcome_json(const auth::RegisterOutcome& outcome) {
+  if (outcome.verification_required) {
+    return nlohmann::json{{"verification_required", true},
+                          {"email", outcome.user.email},
+                          {"message", "验证邮件已发送，请先验证邮箱后再登录"}};
+  }
+  return token_pair_json(outcome.tokens);
 }
 
 inline nlohmann::json api_key_json(const auth::ApiKeyInfo& info) {
@@ -51,6 +61,14 @@ inline AuthHttpError auth_http_error(auth::AuthErrorCode code) {
   switch (code) {
     case auth::AuthErrorCode::EmailExists:
       return {409, "email_exists"};
+    case auth::AuthErrorCode::InvalidToken:
+      return {400, "invalid_token"};
+    case auth::AuthErrorCode::EmailNotVerified:
+      return {403, "email_not_verified"};
+    case auth::AuthErrorCode::RateLimited:
+      return {429, "rate_limited"};
+    case auth::AuthErrorCode::EmailUnavailable:
+      return {503, "email_unavailable"};
     case auth::AuthErrorCode::InvalidCredentials:
       return {401, "invalid_credentials"};
     case auth::AuthErrorCode::Unauthorized:

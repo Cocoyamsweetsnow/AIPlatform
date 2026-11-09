@@ -16,8 +16,12 @@
 #include "quota/quota.h"
 
 #include "auth/auth_service.h"
+#if defined(AIP_WITH_AUTH)
+#include "auth/email_sender.h"
+#endif
 #if defined(AIP_WITH_AUTH) && defined(AIP_WITH_POSTGRES)
 #include "auth/pg_user_store.h"
+#include "auth/rate_limiter.h"
 #endif
 #ifdef AIP_WITH_POSTGRES
 #include "chat/pg_idempotency_store.h"
@@ -89,6 +93,8 @@ int main() {
 #ifdef AIP_WITH_AUTH
     std::unique_ptr<auth::PgUserStore> user_store;
     std::unique_ptr<auth::AuthService> auth_service;
+    std::unique_ptr<auth::RateLimiter> rate_limiter;
+    std::unique_ptr<auth::EmailSender> email_sender;
 #endif
 #endif
     if (config.postgres_enabled()) {
@@ -107,12 +113,30 @@ int main() {
       log_info("storage: postgres（会话/消息持久化，进程重启不丢）");
 #ifdef AIP_WITH_AUTH
       user_store = std::make_unique<auth::PgUserStore>(*db);
+      rate_limiter = std::make_unique<auth::PgRateLimiter>(*db);
+      if (config.smtp_url.empty()) {
+        email_sender = auth::make_log_email_sender();
+        log_warn("auth: 未配置 AIP_SMTP_URL，验证/重置邮件只写日志（仅适合本地/测试）");
+      } else {
+        email_sender = auth::make_smtp_email_sender(config.smtp_url, config.smtp_from,
+                                                    config.smtp_starttls);
+        log_info("auth: SMTP 邮件发送已启用（from=" + config.smtp_from + "）");
+      }
       auth::AuthConfig auth_config;
       auth_config.static_token = config.api_token;
       auth_config.jwt.secret = config.jwt_secret;
       auth_config.jwt.issuer = config.jwt_issuer;
       auth_config.jwt.access_ttl_s = config.jwt_ttl_s;
       auth_config.jwt.refresh_ttl_s = config.jwt_refresh_ttl_s;
+      auth_config.email_verification_required = config.email_verification_required;
+      auth_config.public_base_url = config.public_base_url;
+      auth_config.login_rpm = config.auth_login_rpm;
+      auth_config.register_rpm = config.auth_register_rpm;
+      auth_config.email_rpm = config.auth_email_rpm;
+      auth_config.email_verify_ttl_s = config.email_verify_ttl_s;
+      auth_config.password_reset_ttl_s = config.password_reset_ttl_s;
+      auth_config.rate_limiter = rate_limiter.get();
+      auth_config.email_sender = email_sender.get();
       auth_service = std::make_unique<auth::AuthService>(*user_store, std::move(auth_config));
       auth_ptr = auth_service.get();
       if (config.auth_enabled()) {

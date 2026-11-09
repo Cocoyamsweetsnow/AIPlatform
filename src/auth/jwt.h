@@ -24,6 +24,8 @@ struct JwtClaims {
   std::string email;
   std::string role;
   bool refresh = false;
+  std::string jti;        // refresh token 的服务端吊销键
+  int token_version = 0;  // 与 users.token_version 比较
   long long iat = 0;
   long long exp = 0;
 
@@ -34,7 +36,8 @@ class JwtService {
  public:
   explicit JwtService(JwtConfig config);
 
-  std::string sign(const User& user, bool refresh) const;
+  std::string sign(const User& user, bool refresh,
+                   const std::string& jti = std::string{}) const;
 
   /// 校验签名、iss、exp、type；失败返回 nullopt。
   std::optional<JwtClaims> verify(const std::string& token, bool expect_refresh) const;

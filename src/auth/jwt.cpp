@@ -89,18 +89,21 @@ JwtService::JwtService(JwtConfig config) : config_(std::move(config)) {
   }
 }
 
-std::string JwtService::sign(const User& user, bool refresh) const {
+std::string JwtService::sign(const User& user, bool refresh,
+                            const std::string& jti) const {
   const std::time_t now = std::time(nullptr);
   const int ttl = refresh ? config_.refresh_ttl_s : config_.access_ttl_s;
 
   const json header{{"alg", "HS256"}, {"typ", "JWT"}};
-  const json payload{{"iss", config_.issuer},
-                     {"sub", std::to_string(user.id)},
-                     {"email", user.email},
-                     {"role", user.role},
-                     {"type", refresh ? "refresh" : "access"},
-                     {"iat", static_cast<long long>(now)},
-                     {"exp", static_cast<long long>(now) + ttl}};
+  json payload{{"iss", config_.issuer},
+               {"sub", std::to_string(user.id)},
+               {"email", user.email},
+               {"role", user.role},
+               {"type", refresh ? "refresh" : "access"},
+               {"ver", user.token_version},
+               {"iat", static_cast<long long>(now)},
+               {"exp", static_cast<long long>(now) + ttl}};
+  if (!jti.empty()) payload["jti"] = jti;
 
   const std::string signing_input =
       base64url_encode(header.dump()) + "." + base64url_encode(payload.dump());
@@ -167,6 +170,8 @@ std::optional<JwtClaims> JwtService::verify(const std::string& token,
   claims.email = payload.value("email", "");
   claims.role = payload.value("role", "user");
   claims.refresh = type == "refresh";
+  claims.jti = payload.value("jti", "");
+  claims.token_version = payload.value("ver", 0);
   claims.iat = payload.value("iat", 0LL);
   claims.exp = exp;
   return claims;

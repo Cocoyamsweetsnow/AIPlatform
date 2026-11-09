@@ -11,10 +11,13 @@
 #include "storage/migrations.h"
 #include "usage/pg_usage_sink.h"
 #ifdef AIP_WITH_AUTH
+#include <ctime>
+
 #include "auth/api_key.h"
 #include "auth/auth_service.h"
 #include "auth/errors.h"
 #include "auth/pg_user_store.h"
+#include "auth/rate_limiter.h"
 #endif
 
 namespace {
@@ -57,7 +60,8 @@ int main() {
     storage::run_migrations(pool);
 
     pool.exec(
-        "TRUNCATE users, api_keys, sessions, messages, usage_records, request_dedup "
+        "TRUNCATE users, api_keys, sessions, messages, usage_records, request_dedup,"
+        " refresh_tokens, one_time_tokens, rate_limits "
         "RESTART IDENTITY CASCADE");
 
     const std::int64_t alice = make_user(pool, "alice@example.com");
@@ -71,12 +75,15 @@ int main() {
     auth::AuthConfig auth_config;
     auth_config.jwt.secret = "0123456789abcdef0123456789abcdef";
     auth_config.jwt.access_ttl_s = 900;
+    auth_config.public_base_url = "https://chat.example.com";
     auth::AuthService auth_service(user_store, auth_config);
 
-    const auth::TokenPair carol =
+    const auth::RegisterOutcome carol_registered =
         auth_service.register_user("carol@example.com", "password123", "Carol");
+    const auth::TokenPair& carol = carol_registered.tokens;
     CHECK(carol.user.id > 0);
     CHECK(carol.user.email == "carol@example.com");
+    CHECK(carol.user.email_verified);
 
     const auto found = user_store.find_by_email("CAROL@example.com");
     CHECK(found.has_value());
@@ -88,6 +95,44 @@ int main() {
 
     const auth::TokenPair login = auth_service.login("carol@example.com", "password123");
     CHECK(login.user.id == carol.user.id);
+
+    // refresh 轮换：旧 token 立即失效。
+    const auth::TokenPair rotated = auth_service.refresh(login.refresh_token);
+    CHECK(rotated.user.id == carol.user.id);
+    bool old_refresh_reused = false;
+    try {
+      auth_service.refresh(login.refresh_token);
+    } catch (const auth::AuthError& e) {
+      old_refresh_reused = e.code() == auth::AuthErrorCode::Unauthorized;
+    }
+    CHECK(old_refresh_reused);
+    CHECK(auth_service.authenticate_bearer(rotated.access_token).has_value());
+
+    // 改密后旧 access token 失效，新 token 生效。
+    const auth::TokenPair changed =
+        auth_service.change_password(*carol_principal, "password123", "newpassword123");
+    CHECK(!auth_service.authenticate_bearer(carol.access_token).has_value());
+    CHECK(auth_service.authenticate_bearer(changed.access_token).has_value());
+    CHECK(auth_service.login("carol@example.com", "newpassword123").user.id == carol.user.id);
+
+    // 一次性 token 只能消费一次。
+    CHECK(user_store.create_one_time_token(carol.user.id, "password_reset",
+                                           auth::sha256_hex("one-time-test"),
+                                           std::time(nullptr) + 600));
+    const auto consumed =
+        user_store.consume_one_time_token("password_reset", auth::sha256_hex("one-time-test"));
+    CHECK(consumed.has_value() && *consumed == carol.user.id);
+    CHECK(!user_store
+               .consume_one_time_token("password_reset", auth::sha256_hex("one-time-test"))
+               .has_value());
+
+    // 固定窗口限流在多副本/多连接下共享同一张表。
+    auth::PgRateLimiter limiter(pool);
+    CHECK(limiter.check("test:bucket", 2, 60).allowed);
+    CHECK(limiter.check("test:bucket", 2, 60).allowed);
+    const auth::RateLimitDecision denied = limiter.check("test:bucket", 2, 60);
+    CHECK(!denied.allowed);
+    CHECK(denied.retry_after_s >= 1);
 
     bool duplicate = false;
     try {
@@ -207,7 +252,8 @@ int main() {
     dedup.remove("u:stale", "req-stale");
 
     pool.exec(
-        "TRUNCATE users, api_keys, sessions, messages, usage_records, request_dedup "
+        "TRUNCATE users, api_keys, sessions, messages, usage_records, request_dedup,"
+        " refresh_tokens, one_time_tokens, rate_limits "
         "RESTART IDENTITY CASCADE");
   } catch (const std::exception& e) {
     std::printf("pg_tests failed with exception: %s\n", e.what());

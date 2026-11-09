@@ -22,6 +22,20 @@ class PgUserStore final : public UserStore {
   std::vector<ApiKeyInfo> list_api_keys(std::int64_t user_id) override;
   bool revoke_api_key(std::int64_t user_id, std::int64_t key_id) override;
 
+  bool mark_email_verified(std::int64_t user_id) override;
+  std::optional<int> update_password(std::int64_t user_id,
+                                     const std::string& password_hash) override;
+  bool create_refresh_token(std::int64_t user_id, const std::string& jti,
+                            long long expires_at) override;
+  bool rotate_refresh_token(std::int64_t user_id, const std::string& old_jti,
+                            const std::string& new_jti, long long expires_at) override;
+  bool revoke_refresh_token(std::int64_t user_id, const std::string& jti) override;
+  void revoke_all_refresh_tokens(std::int64_t user_id) override;
+  bool create_one_time_token(std::int64_t user_id, const std::string& purpose,
+                             const std::string& token_hash, long long expires_at) override;
+  std::optional<std::int64_t> consume_one_time_token(
+      const std::string& purpose, const std::string& token_hash) override;
+
  private:
   storage::DbPool& db_;
 };

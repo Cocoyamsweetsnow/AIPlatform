@@ -58,6 +58,18 @@ struct Config {
   int jwt_ttl_s{900};                 // access token 15 分钟
   int jwt_refresh_ttl_s{7 * 24 * 3600};
 
+  // 账号安全（M6）
+  bool email_verification_required{false};
+  std::string public_base_url{"http://127.0.0.1:8080"};
+  std::string smtp_url;
+  std::string smtp_from{"noreply@aiplatform.local"};
+  bool smtp_starttls{true};
+  int auth_login_rpm{20};     // 每 IP 每分钟登录尝试；0 = 不限
+  int auth_register_rpm{10};  // 每 IP 每分钟注册尝试
+  int auth_email_rpm{5};      // 每邮箱每分钟找回密码/验证邮件
+  int email_verify_ttl_s{86400};
+  int password_reset_ttl_s{1800};
+
   // 配额（阶段 4；0 = 不限）
   int rpm_limit{60};                  // 每用户每分钟请求数
   int daily_token_limit{1000000};     // 每用户每日 token

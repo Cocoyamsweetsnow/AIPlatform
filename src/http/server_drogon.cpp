@@ -124,7 +124,9 @@ bool is_public_path(const platform::Config& config, const std::string& path) {
     return true;
   }
   if (path == "/v1/auth/register" || path == "/v1/auth/login" ||
-      path == "/v1/auth/refresh") {
+      path == "/v1/auth/refresh" || path == "/v1/auth/logout" ||
+      path == "/v1/auth/verify-email" || path == "/v1/auth/password/forgot" ||
+      path == "/v1/auth/password/reset") {
     return true;
   }
   return config.web_enabled && web::is_public_asset(path);
@@ -617,6 +619,7 @@ struct ApiServer::Impl {
   void pre_routing(const HttpRequestPtr& req, drogon::AdviceCallback&& callback,
                    drogon::AdviceChainCallback&& chain);
   auth::Principal principal_from(const HttpRequestPtr& req) const;
+  std::string client_ip(const HttpRequestPtr& req) const;
   void handle_chat(const HttpRequestPtr& req, ResponseCallback&& callback);
   void handle_models(const HttpRequestPtr& req, ResponseCallback&& callback);
   void handle_non_stream(const auth::Principal& principal,
@@ -630,6 +633,11 @@ struct ApiServer::Impl {
   void handle_auth_register(const HttpRequestPtr& req, ResponseCallback&& callback);
   void handle_auth_login(const HttpRequestPtr& req, ResponseCallback&& callback);
   void handle_auth_refresh(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_logout(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_verify_email(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_password_forgot(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_password_reset(const HttpRequestPtr& req, ResponseCallback&& callback);
+  void handle_auth_password_change(const HttpRequestPtr& req, ResponseCallback&& callback);
   void handle_auth_me(const HttpRequestPtr& req, ResponseCallback&& callback);
   void handle_auth_list_api_keys(const HttpRequestPtr& req, ResponseCallback&& callback);
   void handle_auth_create_api_key(const HttpRequestPtr& req, ResponseCallback&& callback);
@@ -772,6 +780,41 @@ void ApiServer::Impl::setup() {
       "/v1/auth/refresh",
       [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
         handle_auth_refresh(req, std::move(callback));
+      },
+      {drogon::Post});
+
+  drogon::app().registerHandler(
+      "/v1/auth/logout",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_logout(req, std::move(callback));
+      },
+      {drogon::Post});
+
+  drogon::app().registerHandler(
+      "/v1/auth/verify-email",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_verify_email(req, std::move(callback));
+      },
+      {drogon::Post});
+
+  drogon::app().registerHandler(
+      "/v1/auth/password/forgot",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_password_forgot(req, std::move(callback));
+      },
+      {drogon::Post});
+
+  drogon::app().registerHandler(
+      "/v1/auth/password/reset",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_password_reset(req, std::move(callback));
+      },
+      {drogon::Post});
+
+  drogon::app().registerHandler(
+      "/v1/auth/password/change",
+      [this](const HttpRequestPtr& req, ResponseCallback&& callback) {
+        handle_auth_password_change(req, std::move(callback));
       },
       {drogon::Post});
 
@@ -1000,6 +1043,22 @@ auth::Principal ApiServer::Impl::principal_from(const HttpRequestPtr& req) const
   principal.is_admin = !config.auth_enabled();
   principal.auth_type = config.auth_enabled() ? "none" : "local";
   return principal;
+}
+
+std::string ApiServer::Impl::client_ip(const HttpRequestPtr& req) const {
+  if (config.trust_proxy) {
+    std::string forwarded = req->getHeader("x-forwarded-for");
+    if (!forwarded.empty()) {
+      const std::size_t comma = forwarded.find(',');
+      if (comma != std::string::npos) forwarded.resize(comma);
+      const auto begin = forwarded.find_first_not_of(" \t");
+      const auto end = forwarded.find_last_not_of(" \t");
+      if (begin != std::string::npos) {
+        return forwarded.substr(begin, end - begin + 1);
+      }
+    }
+  }
+  return req->peerAddr().toIp();
 }
 
 HttpResponsePtr ApiServer::Impl::health_response() {
@@ -1735,8 +1794,12 @@ void ApiServer::Impl::handle_session_update(const HttpRequestPtr& req,
 void ApiServer::Impl::post_auth_error(const std::shared_ptr<ResponseCallback>& callback,
                                       const auth::AuthError& error) {
   const AuthHttpError info = auth_http_error(error.code());
-  post(callback, error_response(static_cast<drogon::HttpStatusCode>(info.status), info.type,
-                                error.what()));
+  auto resp = error_response(static_cast<drogon::HttpStatusCode>(info.status), info.type,
+                             error.what());
+  if (error.retry_after_s() > 0) {
+    resp->addHeader("Retry-After", std::to_string(error.retry_after_s()));
+  }
+  post(callback, std::move(resp));
 }
 
 void ApiServer::Impl::handle_auth_register(const HttpRequestPtr& req,
@@ -1771,11 +1834,20 @@ void ApiServer::Impl::handle_auth_register(const HttpRequestPtr& req,
   const std::string display_name =
       body.contains("display_name") ? body["display_name"].get<std::string>() : std::string{};
   auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const std::string ip = client_ip(req);
 
-  const bool queued = db_workers.submit([this, email, password, display_name, shared_callback] {
+  const bool queued =
+      db_workers.submit([this, email, password, display_name, ip, shared_callback] {
     try {
-      const auth::TokenPair pair = auth_->register_user(email, password, display_name);
-      post(shared_callback, json_ok(token_pair_json(pair)));
+      const auth::RegisterOutcome outcome =
+          auth_->register_user(email, password, display_name, ip);
+      if (outcome.verification_required) {
+        auto resp = json_ok(register_outcome_json(outcome));
+        resp->setStatusCode(drogon::k201Created);
+        post(shared_callback, std::move(resp));
+      } else {
+        post(shared_callback, json_ok(token_pair_json(outcome.tokens)));
+      }
     } catch (const auth::AuthError& e) {
       post_auth_error(shared_callback, e);
     }
@@ -1823,10 +1895,11 @@ void ApiServer::Impl::handle_auth_login(const HttpRequestPtr& req, ResponseCallb
   const std::string email = body["email"].get<std::string>();
   const std::string password = body["password"].get<std::string>();
   auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const std::string ip = client_ip(req);
 
-  const bool queued = db_workers.submit([this, email, password, shared_callback] {
+  const bool queued = db_workers.submit([this, email, password, ip, shared_callback] {
     try {
-      const auth::TokenPair pair = auth_->login(email, password);
+      const auth::TokenPair pair = auth_->login(email, password, ip);
       post(shared_callback, json_ok(token_pair_json(pair)));
     } catch (const auth::AuthError& e) {
       post_auth_error(shared_callback, e);
@@ -1881,9 +1954,10 @@ void ApiServer::Impl::handle_auth_refresh(const HttpRequestPtr& req,
   }
 
   auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
-  const bool queued = db_workers.submit([this, refresh_token, shared_callback] {
+  const std::string ip = client_ip(req);
+  const bool queued = db_workers.submit([this, refresh_token, ip, shared_callback] {
     try {
-      const auth::TokenPair pair = auth_->refresh(refresh_token);
+      const auth::TokenPair pair = auth_->refresh(refresh_token, ip);
       post(shared_callback, json_ok(token_pair_json(pair)));
     } catch (const auth::AuthError& e) {
       post_auth_error(shared_callback, e);
@@ -1905,6 +1979,251 @@ void ApiServer::Impl::handle_auth_refresh(const HttpRequestPtr& req,
   if (!queued) {
     (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
                                       "刷新排队已满，请稍后重试"));
+  }
+}
+
+
+void ApiServer::Impl::handle_auth_logout(const HttpRequestPtr& req,
+                                         ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+
+  std::string refresh_token;
+  if (const auto header = bearer_token(req->getHeader("authorization")); header.has_value()) {
+    refresh_token = *header;
+  } else if (!req->body().empty()) {
+    json body;
+    try {
+      body = json::parse(std::string(req->body()));
+    } catch (const std::exception&) {
+      callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体不是合法 JSON"));
+      return;
+    }
+    if (body.is_object() && body.contains("refresh_token") &&
+        body["refresh_token"].is_string()) {
+      refresh_token = body["refresh_token"].get<std::string>();
+    }
+  }
+
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued = db_workers.submit([this, refresh_token, shared_callback] {
+    auth_->logout(refresh_token);
+    post(shared_callback, json_ok({{"logged_out", true}}));
+  });
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "退出登录排队已满，请稍后重试"));
+  }
+}
+
+void ApiServer::Impl::handle_auth_verify_email(const HttpRequestPtr& req,
+                                               ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+  json body;
+  try {
+    body = json::parse(std::string(req->body()));
+  } catch (const std::exception&) {
+    callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体不是合法 JSON"));
+    return;
+  }
+  if (!body.is_object() || !body.contains("token") || !body["token"].is_string()) {
+    callback(error_response(drogon::k400BadRequest, "invalid_request", "token 必须是字符串"));
+    return;
+  }
+  const std::string token = body["token"].get<std::string>();
+  const std::string ip = client_ip(req);
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued = db_workers.submit([this, token, ip, shared_callback] {
+    try {
+      const auth::TokenPair pair = auth_->verify_email(token, ip);
+      post(shared_callback, json_ok(token_pair_json(pair)));
+    } catch (const auth::AuthError& e) {
+      post_auth_error(shared_callback, e);
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("验证邮箱失败（存储）: ") + e.what());
+      post(shared_callback, error_response(drogon::k503ServiceUnavailable,
+                                           "storage_unavailable",
+                                           "用户存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("验证邮箱失败: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k500InternalServerError, "internal_error", "验证邮箱失败"));
+    }
+  });
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "请求排队已满，请稍后重试"));
+  }
+}
+
+void ApiServer::Impl::handle_auth_password_forgot(const HttpRequestPtr& req,
+                                                  ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+  json body;
+  try {
+    body = json::parse(std::string(req->body()));
+  } catch (const std::exception&) {
+    callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体不是合法 JSON"));
+    return;
+  }
+  if (!body.is_object() || !body.contains("email") || !body["email"].is_string()) {
+    callback(error_response(drogon::k400BadRequest, "invalid_request", "email 必须是字符串"));
+    return;
+  }
+  const std::string email = body["email"].get<std::string>();
+  const std::string ip = client_ip(req);
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued = db_workers.submit([this, email, ip, shared_callback] {
+    try {
+      auth_->request_password_reset(email, ip);
+      auto resp = json_ok({{"message", "如果该邮箱已注册，重置邮件已发送"}});
+      resp->setStatusCode(drogon::k202Accepted);
+      post(shared_callback, std::move(resp));
+    } catch (const auth::AuthError& e) {
+      post_auth_error(shared_callback, e);
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("发送重置邮件失败（存储）: ") + e.what());
+      post(shared_callback, error_response(drogon::k503ServiceUnavailable,
+                                           "storage_unavailable",
+                                           "用户存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("发送重置邮件失败: ") + e.what());
+      post(shared_callback, error_response(drogon::k500InternalServerError,
+                                           "internal_error", "发送重置邮件失败"));
+    }
+  });
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "请求排队已满，请稍后重试"));
+  }
+}
+
+void ApiServer::Impl::handle_auth_password_reset(const HttpRequestPtr& req,
+                                                 ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+  json body;
+  try {
+    body = json::parse(std::string(req->body()));
+  } catch (const std::exception&) {
+    callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体不是合法 JSON"));
+    return;
+  }
+  if (!body.is_object() || !body.contains("token") || !body["token"].is_string() ||
+      !body.contains("new_password") || !body["new_password"].is_string()) {
+    callback(error_response(drogon::k400BadRequest, "invalid_request",
+                            "token 和 new_password 必须是字符串"));
+    return;
+  }
+  const std::string token = body["token"].get<std::string>();
+  const std::string new_password = body["new_password"].get<std::string>();
+  const std::string ip = client_ip(req);
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued = db_workers.submit([this, token, new_password, ip, shared_callback] {
+    try {
+      auth_->reset_password(token, new_password, ip);
+      post(shared_callback, json_ok({{"reset", true}}));
+    } catch (const auth::AuthError& e) {
+      post_auth_error(shared_callback, e);
+    }
+#ifdef AIP_WITH_POSTGRES
+    catch (const storage::DbError& e) {
+      platform::log_error(std::string("重置密码失败（存储）: ") + e.what());
+      post(shared_callback, error_response(drogon::k503ServiceUnavailable,
+                                           "storage_unavailable",
+                                           "用户存储暂时不可用，请稍后重试"));
+    }
+#endif
+    catch (const std::exception& e) {
+      platform::log_error(std::string("重置密码失败: ") + e.what());
+      post(shared_callback,
+           error_response(drogon::k500InternalServerError, "internal_error", "重置密码失败"));
+    }
+  });
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "请求排队已满，请稍后重试"));
+  }
+}
+
+void ApiServer::Impl::handle_auth_password_change(const HttpRequestPtr& req,
+                                                  ResponseCallback&& callback) {
+  if (auth_ == nullptr) {
+    callback(error_response(drogon::k503ServiceUnavailable, "auth_unavailable",
+                            "用户鉴权未启用（需要 AIP_STORAGE=postgres 且编译时开启 AUTH）"));
+    return;
+  }
+  const auth::Principal principal = principal_from(req);
+  if (principal.user_id <= 0) {
+    callback(error_response(drogon::k401Unauthorized, "unauthorized",
+                            "该接口需要用户身份（JWT/API Key）"));
+    return;
+  }
+  json body;
+  try {
+    body = json::parse(std::string(req->body()));
+  } catch (const std::exception&) {
+    callback(error_response(drogon::k400BadRequest, "invalid_json", "请求体不是合法 JSON"));
+    return;
+  }
+  if (!body.is_object() || !body.contains("old_password") ||
+      !body["old_password"].is_string() || !body.contains("new_password") ||
+      !body["new_password"].is_string()) {
+    callback(error_response(drogon::k400BadRequest, "invalid_request",
+                            "old_password 和 new_password 必须是字符串"));
+    return;
+  }
+  const std::string old_password = body["old_password"].get<std::string>();
+  const std::string new_password = body["new_password"].get<std::string>();
+  auto shared_callback = std::make_shared<ResponseCallback>(std::move(callback));
+  const bool queued =
+      db_workers.submit([this, principal, old_password, new_password, shared_callback] {
+        try {
+          const auth::TokenPair pair =
+              auth_->change_password(principal, old_password, new_password);
+          post(shared_callback, json_ok(token_pair_json(pair)));
+        } catch (const auth::AuthError& e) {
+          post_auth_error(shared_callback, e);
+        }
+#ifdef AIP_WITH_POSTGRES
+        catch (const storage::DbError& e) {
+          platform::log_error(std::string("修改密码失败（存储）: ") + e.what());
+          post(shared_callback, error_response(drogon::k503ServiceUnavailable,
+                                               "storage_unavailable",
+                                               "用户存储暂时不可用，请稍后重试"));
+        }
+#endif
+        catch (const std::exception& e) {
+          platform::log_error(std::string("修改密码失败: ") + e.what());
+          post(shared_callback,
+               error_response(drogon::k500InternalServerError, "internal_error", "修改密码失败"));
+        }
+      });
+  if (!queued) {
+    (*shared_callback)(error_response(drogon::k503ServiceUnavailable, "server_busy",
+                                      "请求排队已满，请稍后重试"));
   }
 }
 

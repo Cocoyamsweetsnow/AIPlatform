@@ -98,6 +98,40 @@ CREATE TABLE request_dedup (
 );
 CREATE INDEX request_dedup_status_idx ON request_dedup (status, updated_at);
 )SQL"},
+    {2, "account_security_and_rate_limits", R"SQL(
+ALTER TABLE users ADD COLUMN email_verified_at TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN token_version INT NOT NULL DEFAULT 0;
+
+CREATE TABLE refresh_tokens (
+  jti         TEXT PRIMARY KEY,
+  user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  revoked_at  TIMESTAMPTZ,
+  replaced_by TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX refresh_tokens_user_idx ON refresh_tokens (user_id, expires_at DESC);
+CREATE INDEX refresh_tokens_expiry_idx ON refresh_tokens (expires_at);
+
+CREATE TABLE one_time_tokens (
+  token_hash TEXT PRIMARY KEY,
+  user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  purpose    TEXT NOT NULL CHECK (purpose IN ('email_verify', 'password_reset')),
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at    TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX one_time_tokens_user_idx ON one_time_tokens (user_id, purpose);
+CREATE INDEX one_time_tokens_expiry_idx ON one_time_tokens (expires_at);
+
+CREATE TABLE rate_limits (
+  bucket       TEXT NOT NULL,
+  window_start TIMESTAMPTZ NOT NULL,
+  count        INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (bucket, window_start)
+);
+CREATE INDEX rate_limits_window_idx ON rate_limits (window_start);
+)SQL"},
 };
 
 }  // namespace

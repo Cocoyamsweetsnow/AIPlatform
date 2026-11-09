@@ -10,7 +10,8 @@ namespace auth {
 namespace {
 
 constexpr const char* kUserSelect =
-    "SELECT id, email, display_name, role, password_hash, (disabled_at IS NOT NULL)"
+    "SELECT id, email, display_name, role, password_hash, (disabled_at IS NOT NULL),"
+    "       (email_verified_at IS NOT NULL), token_version"
     " FROM users";
 
 UserRecord read_user(const storage::Result& result, int row) {
@@ -21,6 +22,8 @@ UserRecord read_user(const storage::Result& result, int row) {
   user.role = result.value(row, 3);
   user.password_hash = result.value(row, 4);
   user.disabled = result.value(row, 5) == "t";
+  user.email_verified = result.value(row, 6) == "t";
+  user.token_version = static_cast<int>(result.int64(row, 7));
   return user;
 }
 
@@ -46,7 +49,8 @@ std::optional<UserRecord> PgUserStore::create(const std::string& email,
   try {
     const storage::Result result = db_.exec(
         "INSERT INTO users (email, password_hash, display_name) VALUES ($1, $2, $3)"
-        " RETURNING id, email, display_name, role, password_hash, (disabled_at IS NOT NULL)",
+        " RETURNING id, email, display_name, role, password_hash, (disabled_at IS NOT NULL),"
+        "           (email_verified_at IS NOT NULL), token_version",
         {email, password_hash, display_name});
     if (result.rows() == 0) return std::nullopt;
     return read_user(result, 0);
@@ -110,6 +114,90 @@ bool PgUserStore::revoke_api_key(std::int64_t user_id, std::int64_t key_id) {
       " WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
       {std::to_string(key_id), std::to_string(user_id)});
   return result.affected_rows() > 0;
+}
+
+bool PgUserStore::mark_email_verified(std::int64_t user_id) {
+  const storage::Result result = db_.exec(
+      "UPDATE users SET email_verified_at = COALESCE(email_verified_at, now())"
+      " WHERE id = $1",
+      {std::to_string(user_id)});
+  return result.affected_rows() > 0;
+}
+
+std::optional<int> PgUserStore::update_password(std::int64_t user_id,
+                                                const std::string& password_hash) {
+  storage::Transaction tx(db_.acquire());
+  const storage::Result result = tx.exec(
+      "UPDATE users SET password_hash = $2, token_version = token_version + 1"
+      " WHERE id = $1 RETURNING token_version",
+      {std::to_string(user_id), password_hash});
+  if (result.rows() == 0) return std::nullopt;
+  tx.exec(
+      "UPDATE refresh_tokens SET revoked_at = now()"
+      " WHERE user_id = $1 AND revoked_at IS NULL",
+      {std::to_string(user_id)});
+  tx.commit();
+  return static_cast<int>(result.int64(0, 0));
+}
+
+bool PgUserStore::create_refresh_token(std::int64_t user_id, const std::string& jti,
+                                       long long expires_at) {
+  const storage::Result result = db_.exec(
+      "INSERT INTO refresh_tokens (jti, user_id, expires_at)"
+      " VALUES ($1, $2, to_timestamp($3::double precision))",
+      {jti, std::to_string(user_id), std::to_string(expires_at)});
+  return result.affected_rows() > 0;
+}
+
+bool PgUserStore::rotate_refresh_token(std::int64_t user_id, const std::string& old_jti,
+                                       const std::string& new_jti, long long expires_at) {
+  const storage::Result result = db_.exec(
+      "WITH revoked AS ("
+      "  UPDATE refresh_tokens SET revoked_at = now(), replaced_by = $3"
+      "  WHERE jti = $1 AND user_id = $2 AND revoked_at IS NULL AND expires_at > now()"
+      "  RETURNING jti"
+      ")"
+      " INSERT INTO refresh_tokens (jti, user_id, expires_at)"
+      " SELECT $3, $2, to_timestamp($4::double precision) FROM revoked"
+      " RETURNING jti",
+      {old_jti, std::to_string(user_id), new_jti, std::to_string(expires_at)});
+  return result.rows() > 0;
+}
+
+bool PgUserStore::revoke_refresh_token(std::int64_t user_id, const std::string& jti) {
+  const storage::Result result = db_.exec(
+      "UPDATE refresh_tokens SET revoked_at = now()"
+      " WHERE jti = $1 AND user_id = $2 AND revoked_at IS NULL",
+      {jti, std::to_string(user_id)});
+  return result.affected_rows() > 0;
+}
+
+void PgUserStore::revoke_all_refresh_tokens(std::int64_t user_id) {
+  db_.exec(
+      "UPDATE refresh_tokens SET revoked_at = now()"
+      " WHERE user_id = $1 AND revoked_at IS NULL",
+      {std::to_string(user_id)});
+}
+
+bool PgUserStore::create_one_time_token(std::int64_t user_id, const std::string& purpose,
+                                        const std::string& token_hash,
+                                        long long expires_at) {
+  const storage::Result result = db_.exec(
+      "INSERT INTO one_time_tokens (user_id, purpose, token_hash, expires_at)"
+      " VALUES ($1, $2, $3, to_timestamp($4::double precision))",
+      {std::to_string(user_id), purpose, token_hash, std::to_string(expires_at)});
+  return result.affected_rows() > 0;
+}
+
+std::optional<std::int64_t> PgUserStore::consume_one_time_token(
+    const std::string& purpose, const std::string& token_hash) {
+  const storage::Result result = db_.exec(
+      "UPDATE one_time_tokens SET used_at = now()"
+      " WHERE token_hash = $1 AND purpose = $2 AND used_at IS NULL AND expires_at > now()"
+      " RETURNING user_id",
+      {token_hash, purpose});
+  if (result.rows() == 0) return std::nullopt;
+  return result.int64(0, 0);
 }
 
 }  // namespace auth

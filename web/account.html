@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>账号操作 · AIPlatform</title>
+  <link rel="icon" href="/favicon.svg" />
+  <link rel="stylesheet" href="/assets/app.css" />
+  <style>
+    body { min-height: 100vh; display: grid; place-items: center; margin: 0; padding: 24px; box-sizing: border-box; }
+    .account-card { width: min(440px, 100%); padding: 28px; border: 1px solid var(--border, #ddd); border-radius: 16px; background: var(--panel, #fff); }
+    .account-card h1 { margin: 0 0 8px; font-size: 22px; }
+    .account-card p { color: var(--muted, #666); line-height: 1.6; }
+    .account-field { display: grid; gap: 6px; margin: 18px 0; }
+    .account-field input { padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border, #ccc); font: inherit; }
+    .account-submit { width: 100%; padding: 11px 16px; border: 0; border-radius: 8px; cursor: pointer; font: inherit; }
+    .account-submit:disabled { opacity: .6; cursor: wait; }
+    .account-error { color: #c0392b; }
+    .account-ok { color: #188038; }
+    .account-back { display: inline-block; margin-top: 18px; }
+  </style>
+</head>
+<body>
+  <main class="account-card">
+    <h1 id="accountTitle">账号操作</h1>
+    <p id="accountMessage">正在处理…</p>
+    <form id="accountForm" hidden>
+      <label class="account-field">
+        <span>新密码（8~128 个字符）</span>
+        <input id="newPassword" type="password" minlength="8" maxlength="128"
+               autocomplete="new-password" required />
+      </label>
+      <button class="account-submit" id="accountSubmit" type="submit">重置密码</button>
+    </form>
+    <a class="account-back" href="/">返回对话</a>
+  </main>
+  <script src="/assets/account.js"></script>
+</body>
+</html>

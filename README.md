@@ -27,6 +27,7 @@
 - ✅ **PostgreSQL 持久化（M1）**：`AIP_STORAGE=postgres` 时会话/消息落库，重启不丢；
   迁移自动执行、连接池、软删除、按用户隔离的会话归属
 - ✅ 鉴权：静态 `AIP_TOKEN`（admin）/ JWT（HS256，access 15m + refresh 7d）/ API Key（SHA-256 哈希、可撤销）
+- ✅ 账号安全：refresh 轮换与吊销、改密踢下线、邮箱验证、找回密码、登录/注册限流、恒定时间假哈希
 - ✅ 多租户会话归属：普通用户只能访问自己的会话；admin 可访问全部
 - ✅ 配额限流：每用户 RPM / 并发流 / 每日 token；超出返回 429 + `Retry-After`
 - ✅ 用量流水：`usage_records` 记录 prompt/completion tokens、TTFT、latency
@@ -224,7 +225,9 @@ AIP_WEB=false ./build/aiplatform
   "storage": "memory", "auth_required": false, "web": true,
   "auth": {
     "user_accounts": false, "password_login": false, "registration": false,
-    "static_token": false, "access_ttl_s": 900, "refresh_ttl_s": 604800
+    "static_token": false, "email_verification_required": false,
+    "password_reset": true, "refresh_rotation": true,
+    "access_ttl_s": 900, "refresh_ttl_s": 604800
   },
   "max_message_bytes": 32768, "max_streams": 512
 }
@@ -243,6 +246,11 @@ AIP_WEB=false ./build/aiplatform
 | GET | `/v1/auth/api-keys` | 用户 | 当前用户的 API Key 列表（不含明文/哈希） |
 | POST | `/v1/auth/api-keys` | 用户 | 创建 API Key，`key` 明文只返回一次 |
 | DELETE | `/v1/auth/api-keys/{id}` | 用户 | 撤销 API Key |
+| POST | `/v1/auth/logout` | 公开（需 refresh token） | 吊销 refresh token（幂等） |
+| POST | `/v1/auth/verify-email` | 公开 | 消费邮箱验证 token，返回 JWT 对 |
+| POST | `/v1/auth/password/forgot` | 公开 | 发送重置密码邮件；始终 202，避免枚举 |
+| POST | `/v1/auth/password/reset` | 公开 | 消费一次性 token 重置密码 |
+| POST | `/v1/auth/password/change` | 用户 | 校验旧密码后改密，返回新 JWT 对 |
 
 ```jsonc
 // POST /v1/auth/register
@@ -260,6 +268,25 @@ AIP_WEB=false ./build/aiplatform
 
 鉴权头统一为 `Authorization: Bearer <JWT | API Key | AIP_TOKEN>`。
 普通用户的会话互相隔离；跨用户访问历史返回 404（避免枚举）。
+
+**账号安全（M6）**
+
+- **refresh 轮换**：每次 `/v1/auth/refresh` 都会吊销旧 refresh token 并签发新 token；
+  旧 token 重放返回 401。退出登录会吊销当前 refresh token。
+- **改密/重置踢下线**：`token_version` 自增，旧 access token 立即失效；
+  所有 refresh token 同时吊销，客户端需要重新登录（改密接口会返回新 JWT 对）。
+- **邮箱验证**：`AIP_EMAIL_VERIFICATION_REQUIRED=1` 时，注册返回
+  `201 {"verification_required":true}`，验证前登录返回 `403 email_not_verified`；
+  邮件链接指向内置的 `/account.html?mode=verify&token=...` 落地页。
+- **找回密码**：`/v1/auth/password/forgot` 生成一次性 token（数据库只存 SHA-256），
+  重置链接指向 `/account.html?mode=reset&token=...`；token 只能使用一次。
+- **限流**：登录/注册/找回密码按 IP + 邮箱固定窗口计数（PostgreSQL `rate_limits` 表，
+  多副本共享），超限返回 429 + `Retry-After`。
+- **枚举防护**：登录时用户不存在也执行一次 Argon2 假哈希；找回密码对不存在的邮箱
+  也返回 202。
+- **邮件配置**：生产设置 `AIP_SMTP_URL`；未配置时验证/重置链接只写日志，仅适合本地。
+- **Web 端**：token 仍存 `localStorage`（演示级）。生产建议改用 httpOnly cookie + BFF，
+  或在 Nginx/BFF 层做 CSRF 防护；`/v1/config` 的 `auth` 字段会告诉前端是否开启验证/重置。
 
 ### `POST /v1/chat/completions`
 
@@ -535,6 +562,7 @@ RAG/工具调用/本地推理。
 | [docs/adr/0004-quota-usage.md](docs/adr/0004-quota-usage.md) | 配额/限流/用量流水设计 |
 | [docs/adr/0005-idempotency-sessions.md](docs/adr/0005-idempotency-sessions.md) | 请求幂等与会话管理 API |
 | [docs/adr/0006-context-budget.md](docs/adr/0006-context-budget.md) | token 预算上下文裁剪 |
+| [docs/adr/0007-account-security.md](docs/adr/0007-account-security.md) | refresh 轮换/吊销、邮箱验证、找回密码、登录限流 |
 | [docs/BUILD.md](docs/BUILD.md) | 编译、运行、镜像构建、排错手册 |
 | [docs/GIT.md](docs/GIT.md) | Git 工作流、提交规范、发布与事故处理 |
 

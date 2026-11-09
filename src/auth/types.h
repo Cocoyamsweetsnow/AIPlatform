@@ -11,6 +11,8 @@ struct User {
   std::string email;
   std::string display_name;
   std::string role = "user";
+  bool email_verified = false;
+  int token_version = 0;  // 改密/重置后 +1，旧 access token 立即失效
 
   bool is_admin() const { return role == "admin"; }
 };

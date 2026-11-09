@@ -109,10 +109,14 @@ if(AIPLATFORM_WITH_AUTH)
     src/auth/password_hasher.cpp
     src/auth/jwt.cpp
     src/auth/api_key.cpp
+    src/auth/email_sender.cpp
     src/auth/auth_service.cpp
   )
   if(AIPLATFORM_WITH_POSTGRES)
-    list(APPEND AIP_CORE_SOURCES src/auth/pg_user_store.cpp)
+    list(APPEND AIP_CORE_SOURCES
+      src/auth/pg_user_store.cpp
+      src/auth/rate_limiter.cpp
+    )
   endif()
 endif()
 add_library(ai_core STATIC ${AIP_CORE_SOURCES})

@@ -1229,6 +1229,12 @@
           });
       })
       .then(function (pair) {
+        if (pair && pair.verification_required) {
+          setAuthError("验证邮件已发送，请先完成邮箱验证后再登录");
+          setAuthMode("login");
+          toast("验证邮件已发送，请检查邮箱", "success", 4000);
+          return;
+        }
         if (!applyTokenPair(pair)) throw new Error("登录返回的数据不完整");
         stopStreaming();
         if (state.authGate) hideAuthGate();
@@ -2136,6 +2142,40 @@
         if (dom.authEmail) dom.authEmail.focus();
       });
     }
+    if (dom.authForgotBtn) {
+      dom.authForgotBtn.addEventListener("click", function () {
+        var email = dom.authEmail ? dom.authEmail.value.trim() : "";
+        if (!email) {
+          setAuthError("请先填写邮箱，再点忘记密码");
+          return;
+        }
+        fetch("/v1/auth/password/forgot", {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({ email: email })
+        })
+          .then(function (response) {
+            return response
+              .json()
+              .catch(function () { return {}; })
+              .then(function (body) {
+                if (!response.ok) {
+                  throw new Error(
+                    (body && body.error && body.error.message) ||
+                      "请求失败（HTTP " + response.status + "）"
+                  );
+                }
+                return body;
+              });
+          })
+          .then(function () {
+            toast("如果该邮箱已注册，重置邮件已发送", "success", 4000);
+          })
+          .catch(function (error) {
+            setAuthError(error.message || "发送重置邮件失败");
+          });
+      });
+    }
     if (dom.authTokenBtn) {
       dom.authTokenBtn.addEventListener("click", function () {
         if (state.authGate) return;
@@ -2361,6 +2401,7 @@
     dom.authSubmit = $("#authSubmit");
     dom.authSwitchText = $("#authSwitchText");
     dom.authSwitchBtn = $("#authSwitchBtn");
+    dom.authForgotBtn = $("#authForgotBtn");
     dom.authTokenBtn = $("#authTokenBtn");
     dom.offlineBanner = $("#offlineBanner");
     dom.offlineRetryBtn = $("#offlineRetryBtn");

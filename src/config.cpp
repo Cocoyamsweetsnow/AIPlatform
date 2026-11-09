@@ -117,6 +117,19 @@ Config Config::from_env() {
   c.jwt_issuer = env_str("AIP_JWT_ISSUER", c.jwt_issuer);
   c.jwt_ttl_s = env_int("AIP_JWT_TTL_S", c.jwt_ttl_s);
   c.jwt_refresh_ttl_s = env_int("AIP_JWT_REFRESH_TTL_S", c.jwt_refresh_ttl_s);
+
+  c.email_verification_required =
+      env_bool("AIP_EMAIL_VERIFICATION_REQUIRED", c.email_verification_required);
+  c.public_base_url = env_str("AIP_PUBLIC_BASE_URL", c.public_base_url);
+  c.smtp_url = env_str("AIP_SMTP_URL", c.smtp_url);
+  c.smtp_from = env_str("AIP_SMTP_FROM", c.smtp_from);
+  c.smtp_starttls = env_bool("AIP_SMTP_STARTTLS", c.smtp_starttls);
+  c.auth_login_rpm = env_int("AIP_AUTH_LOGIN_RPM", c.auth_login_rpm);
+  c.auth_register_rpm = env_int("AIP_AUTH_REGISTER_RPM", c.auth_register_rpm);
+  c.auth_email_rpm = env_int("AIP_AUTH_EMAIL_RPM", c.auth_email_rpm);
+  c.email_verify_ttl_s = env_int("AIP_EMAIL_VERIFY_TTL_S", c.email_verify_ttl_s);
+  c.password_reset_ttl_s =
+      env_int("AIP_PASSWORD_RESET_TTL_S", c.password_reset_ttl_s);
   c.rpm_limit = env_int("AIP_RPM_LIMIT", c.rpm_limit);
   c.daily_token_limit = env_int("AIP_DAILY_TOKEN_LIMIT", c.daily_token_limit);
   c.max_concurrent_per_user =
@@ -214,6 +227,27 @@ Config Config::from_env() {
   }
   if (!c.jwt_secret.empty() && c.jwt_secret.size() < 32) {
     throw std::runtime_error("AIP_JWT_SECRET 至少 32 个字节（建议 openssl rand -hex 32）");
+  }
+  if (c.auth_login_rpm < 0 || c.auth_login_rpm > 100000) {
+    throw std::runtime_error("AIP_AUTH_LOGIN_RPM 应在 [0, 100000]");
+  }
+  if (c.auth_register_rpm < 0 || c.auth_register_rpm > 100000) {
+    throw std::runtime_error("AIP_AUTH_REGISTER_RPM 应在 [0, 100000]");
+  }
+  if (c.auth_email_rpm < 0 || c.auth_email_rpm > 100000) {
+    throw std::runtime_error("AIP_AUTH_EMAIL_RPM 应在 [0, 100000]");
+  }
+  if (c.email_verify_ttl_s < 60 || c.email_verify_ttl_s > 7 * 24 * 3600) {
+    throw std::runtime_error("AIP_EMAIL_VERIFY_TTL_S 应在 [60, 604800]");
+  }
+  if (c.password_reset_ttl_s < 60 || c.password_reset_ttl_s > 24 * 3600) {
+    throw std::runtime_error("AIP_PASSWORD_RESET_TTL_S 应在 [60, 86400]");
+  }
+  if (c.smtp_from.find_first_of("\r\n") != std::string::npos) {
+    throw std::runtime_error("AIP_SMTP_FROM 不能包含换行");
+  }
+  if (!c.public_base_url.empty() && c.public_base_url.back() == '/') {
+    c.public_base_url.pop_back();
   }
   if (c.rpm_limit < 0 || c.rpm_limit > 1000000) {
     throw std::runtime_error("AIP_RPM_LIMIT 应在 [0, 1000000]（0 表示不限）");
